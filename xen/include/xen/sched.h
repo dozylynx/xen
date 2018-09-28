@@ -22,6 +22,7 @@
 #include <asm/atomic.h>
 #include <xen/vpci.h>
 #include <xen/wait.h>
+#include <xen/argo.h>
 #include <public/xen.h>
 #include <public/domctl.h>
 #include <public/sysctl.h>
@@ -490,6 +491,12 @@ struct domain
         unsigned int guest_request_enabled       : 1;
         unsigned int guest_request_sync          : 1;
     } monitor;
+
+#ifdef CONFIG_ARGO
+    /* Argo interdomain communication support */
+    rwlock_t argo_lock;
+    struct argo_domain *argo;
+#endif
 };
 
 /* Protect updates/reads (resp.) of domain_list and domain_hash. */
