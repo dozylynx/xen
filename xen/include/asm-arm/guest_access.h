@@ -24,6 +24,11 @@ int access_guest_memory_by_ipa(struct domain *d, paddr_t ipa, void *buf,
 #define __raw_copy_from_guest raw_copy_from_guest
 #define __raw_clear_guest raw_clear_guest
 
+#define raw_copy_from_guest_errno(dst, src, len)             \
+    (raw_copy_from_guest((dst), (src), (len)) ? -EFAULT : 0)
+#define raw_copy_to_guest_errno(dst, src, len)               \
+    (raw_copy_to_guest((dst), (src), (len)) ? -EFAULT : 0)
+
 /* Remainder copied from x86 -- could be common? */
 
 /* Is the guest handle a NULL reference? */
@@ -112,6 +117,26 @@ int access_guest_memory_by_ipa(struct domain *d, paddr_t ipa, void *buf,
     typeof(&(ptr)->field) _d = &(ptr)->field;           \
     raw_copy_from_guest(_d, _s, sizeof(*_d));           \
 })
+
+/* errno returning copy functions */
+#define copy_from_guest_offset_errno(ptr, hnd, off, nr) ({              \
+            const typeof(*(ptr)) *_s = (hnd).p;                         \
+            typeof(*(ptr)) *_d = (ptr);                                 \
+            raw_copy_from_guest_errno(_d, _s + (off), sizeof(*_d) * (nr)); \
+        })
+
+#define copy_field_to_guest_errno(hnd, ptr, field) ({           \
+            const typeof(&(ptr)->field) _s = &(ptr)->field;     \
+            void *_d = &(hnd).p->field;                         \
+            ((void)(&(hnd).p->field == &(ptr)->field));         \
+            raw_copy_to_guest_errno(_d, _s, sizeof(*_s));       \
+        })
+
+#define copy_field_from_guest_errno(ptr, hnd, field) ({         \
+            const typeof(&(ptr)->field) _s = &(hnd).p->field;   \
+            typeof(&(ptr)->field) _d = &(ptr)->field;           \
+            raw_copy_from_guest_errno(_d, _s, sizeof(*_d));     \
+        })
 
 /*
  * Pre-validate a guest handle.

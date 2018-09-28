@@ -26,6 +26,9 @@
 #define __copy_from_guest(ptr, hnd, nr)                 \
     __copy_from_guest_offset(ptr, hnd, 0, nr)
 
+#define copy_from_guest_errno(ptr, hnd, nr)             \
+    copy_from_guest_offset_errno(ptr, hnd, 0, nr)
+
 #define __clear_guest(hnd, nr)                          \
     __clear_guest_offset(hnd, 0, nr)
 
