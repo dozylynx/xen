@@ -982,6 +982,8 @@ typedef struct {
 #define XEN_GUEST_HANDLE_64(name) XEN_GUEST_HANDLE(name)
 #endif
 
+#define XEN_GUEST_HANDLE_NULL(name) (XEN_GUEST_HANDLE(name)){(name *)0}
+
 #ifndef __ASSEMBLY__
 struct xenctl_bitmap {
     XEN_GUEST_HANDLE_64(uint8) bitmap;
