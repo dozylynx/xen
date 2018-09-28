@@ -19,6 +19,19 @@
 #include <xen/errno.h>
 #include <xen/guest_access.h>
 
+/*
+ * Debugs
+ */
+
+#ifdef ARGO_DEBUG
+#define argo_dprintk(format, args...)            \
+    do {                                         \
+        printk("argo: " format, ## args );       \
+    } while ( 1 == 0 )
+#else
+#define argo_dprintk(format, ... ) (void)0
+#endif
+
 long
 do_argo_message_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg1,
                    XEN_GUEST_HANDLE_PARAM(void) arg2,
