@@ -510,6 +510,59 @@ argo_ring_find_info(const struct domain *d, const struct argo_ring_id *id)
 }
 
 static long
+argo_unregister_ring(struct domain *d,
+                     XEN_GUEST_HANDLE_PARAM(argo_ring_t) ring_hnd)
+{
+    struct argo_ring ring;
+    struct argo_ring_info *ring_info;
+    int ret = 0;
+
+    read_lock(&argo_lock);
+
+    do {
+        if ( !d->argo )
+        {
+            ret = -ENODEV;
+            break;
+        }
+
+        ret = copy_from_guest_errno(&ring, ring_hnd, 1);
+        if ( ret )
+            break;
+
+        if ( ring.magic != ARGO_RING_MAGIC )
+        {
+            argo_dprintk(
+                "ring.magic(%"PRIx64") != ARGO_RING_MAGIC(%llx), EINVAL\n",
+                ring.magic, ARGO_RING_MAGIC);
+            ret = -EINVAL;
+            break;
+        }
+
+        ring.id.addr.domain_id = d->domain_id;
+
+        write_lock(&d->argo->lock);
+
+        ring_info = argo_ring_find_info(d, &ring.id);
+        if ( ring_info )
+            argo_ring_remove_info(d, ring_info);
+
+        write_unlock(&d->argo->lock);
+
+        if ( !ring_info )
+        {
+            argo_dprintk("ENOENT\n");
+            ret = -ENOENT;
+            break;
+        }
+
+    } while ( 0 );
+
+    read_unlock(&argo_lock);
+    return ret;
+}
+
+static long
 argo_register_ring(struct domain *d,
                    XEN_GUEST_HANDLE_PARAM(argo_ring_t) ring_hnd,
                    XEN_GUEST_HANDLE_PARAM(argo_pfn_t) pfn_hnd, uint32_t npage,
@@ -749,6 +802,15 @@ do_argo_message_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg1,
         }
 
         rc = argo_register_ring(d, ring_hnd, pfn_hnd, npage, fail_exist);
+        break;
+    }
+    case ARGO_MESSAGE_OP_unregister_ring:
+    {
+        XEN_GUEST_HANDLE_PARAM(argo_ring_t) ring_hnd =
+            guest_handle_cast(arg1, argo_ring_t);
+        if ( unlikely(!guest_handle_okay(ring_hnd, 1)) )
+            break;
+        rc = argo_unregister_ring(d, ring_hnd);
         break;
     }
     default:

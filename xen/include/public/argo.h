@@ -116,4 +116,13 @@ struct argo_ring_message_header
 /* Mask for all defined flags */
 #define ARGO_REGISTER_FLAG_MASK ARGO_REGISTER_FLAG_FAIL_EXIST
 
+/*
+ * ARGO_MESSAGE_OP_unregister_ring
+ *
+ * Unregister a previously-registered ring, ending communication.
+ *
+ * arg1: XEN_GUEST_HANDLE(argo_ring_t)
+ */
+#define ARGO_MESSAGE_OP_unregister_ring     2
+
 #endif
