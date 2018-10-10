@@ -22,6 +22,7 @@
 #include "xen.h"
 
 #define ARGO_RING_MAGIC      0xbd67e163e7777f2fULL
+#define ARGO_RING_DATA_MAGIC 0xcce4d30fbc82e92aULL
 
 #define ARGO_DOMID_ANY           DOMID_INVALID
 
@@ -103,6 +104,40 @@ typedef struct argo_ring
  */
 #define ARGO_ROUNDUP(a) (((a) + 0xf) & ~(typeof(a))0xf)
 
+/*
+ * Notify flags
+ */
+/* Ring is empty */
+#define ARGO_RING_DATA_F_EMPTY       (1U << 0)
+/* Ring exists */
+#define ARGO_RING_DATA_F_EXISTS      (1U << 1)
+/* Pending interrupt exists. Do not rely on this field - for profiling only */
+#define ARGO_RING_DATA_F_PENDING     (1U << 2)
+/* Sufficient space to queue space_required bytes exists */
+#define ARGO_RING_DATA_F_SUFFICIENT  (1U << 3)
+
+typedef struct argo_ring_data_ent
+{
+    argo_addr_t ring;
+    uint16_t flags;
+    uint16_t pad;
+    uint32_t space_required;
+    uint32_t max_message_size;
+} argo_ring_data_ent_t;
+
+typedef struct argo_ring_data
+{
+    uint64_t magic;
+    uint32_t nent;
+    uint32_t pad;
+    uint64_t reserved[4];
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 199901L
+    argo_ring_data_ent_t data[];
+#elif defined(__GNUC__)
+    argo_ring_data_ent_t data[0];
+#endif
+} argo_ring_data_t;
+
 struct argo_ring_message_header
 {
     uint32_t len;
@@ -178,6 +213,33 @@ struct argo_ring_message_header
  * arg4: uint32_t message type
  */
 #define ARGO_MESSAGE_OP_sendv               5
+
+/*
+ * ARGO_MESSAGE_OP_notify
+ *
+ * Asks Xen for information about other rings in the system.
+ *
+ * ent->ring is the argo_addr_t of the ring you want information on.
+ * Uses the same ring matching rules as ARGO_MESSAGE_OP_sendv.
+ *
+ * ent->space_required : if this field is not null then Xen will check
+ * that there is space in the destination ring for this many bytes of payload.
+ * If sufficient space is available, it will set ARGO_RING_DATA_F_SUFFICIENT
+ * and CANCEL any pending notification for that ent->ring; otherwise it
+ * will schedule a notification event and the flag will not be set.
+ *
+ * These flags are set by Xen when notify replies:
+ * ARGO_RING_DATA_F_EMPTY       ring is empty
+ * ARGO_RING_DATA_F_PENDING     notify event is pending - * don't rely on this *
+ * ARGO_RING_DATA_F_SUFFICIENT  sufficient space for space_required is there
+ * ARGO_RING_DATA_F_EXISTS      ring exists
+ *
+ * arg1: XEN_GUEST_HANDLE(argo_ring_data_t) ring_data (may be NULL)
+ * arg2: NULL
+ * arg3: 0 (ZERO)
+ * arg4: 0 (ZERO)
+ */
+#define ARGO_MESSAGE_OP_notify              4
 
 /* The maximum size of a guest message that may be sent on an Argo ring. */
 #define ARGO_MAX_MSG_SIZE ((ARGO_MAX_RING_SIZE) - \
