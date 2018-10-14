@@ -32,6 +32,21 @@ DEFINE_XEN_GUEST_HANDLE(argo_ring_t);
 static bool __read_mostly opt_argo_enabled = 0;
 boolean_param("argo", opt_argo_enabled);
 
+/* Xen command line option for conservative or relaxed access control */
+bool __read_mostly argo_mac_bootparam_enforcing = true;
+
+static int __init parse_argo_mac_param(const char *s)
+{
+    if ( !strncmp(s, "enforcing", 10) )
+        argo_mac_bootparam_enforcing = true;
+    else if ( !strncmp(s, "permissive", 11) )
+        argo_mac_bootparam_enforcing = false;
+    else
+        return -EINVAL;
+    return 0;
+}
+custom_param("argo_mac", parse_argo_mac_param);
+
 struct argo_pending_ent
 {
     struct hlist_node node;

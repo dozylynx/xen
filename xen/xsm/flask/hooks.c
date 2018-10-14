@@ -1717,6 +1717,21 @@ static int flask_domain_resource_map(struct domain *d)
     return current_has_perm(d, SECCLASS_DOMAIN2, DOMAIN2__RESOURCE_MAP);
 }
 
+#ifdef CONFIG_ARGO
+static int flask_argo_register_single_source(struct domain *d,
+                                             struct domain *t)
+{
+    return domain_has_perm(d, t, SECCLASS_ARGO,
+                           ARGO__REGISTER_SINGLE_SOURCE);
+}
+
+static int flask_argo_register_any_source(struct domain *d)
+{
+    return avc_has_perm(domain_sid(d), SECINITSID_XEN, SECCLASS_ARGO,
+                        ARGO__REGISTER_ANY_SOURCE, NULL);
+}
+#endif
+
 long do_flask_op(XEN_GUEST_HANDLE_PARAM(xsm_op_t) u_flask_op);
 int compat_flask_op(XEN_GUEST_HANDLE_PARAM(xsm_op_t) u_flask_op);
 
@@ -1851,6 +1866,10 @@ static struct xsm_operations flask_ops = {
 #endif
     .xen_version = flask_xen_version,
     .domain_resource_map = flask_domain_resource_map,
+#ifdef CONFIG_ARGO
+    .argo_register_single_source = flask_argo_register_single_source,
+    .argo_register_any_source = flask_argo_register_any_source,
+#endif
 };
 
 void __init flask_init(const void *policy_buffer, size_t policy_size)
