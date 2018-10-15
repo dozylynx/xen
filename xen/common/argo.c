@@ -26,6 +26,8 @@
 #include <xen/time.h>
 #include <xsm/xsm.h>
 
+#define ARGO_MAX_RINGS_PER_DOMAIN       128U
+
 DEFINE_XEN_GUEST_HANDLE(argo_pfn_t);
 DEFINE_XEN_GUEST_HANDLE(argo_addr_t);
 DEFINE_XEN_GUEST_HANDLE(argo_send_addr_t);
@@ -101,6 +103,8 @@ struct argo_domain
     struct hlist_head ring_hash[ARGO_HTABLE_SIZE];
     /* id cookie, written only at init, so readable with R(L1) */
     uint64_t domain_cookie;
+    /* counter of rings registered by this domain, protected by L2 */
+    uint32_t ring_count;
 };
 
 /*
@@ -1161,7 +1165,10 @@ argo_unregister_ring(struct domain *d,
 
         ring_info = argo_ring_find_info(d, &ring.id);
         if ( ring_info )
+        {
             argo_ring_remove_info(d, ring_info);
+            d->argo->ring_count--;
+        }
 
         write_unlock(&d->argo->lock);
 
@@ -1298,6 +1305,12 @@ argo_register_ring(struct domain *d,
         write_lock(&d->argo->lock);
 
         do {
+            if ( d->argo->ring_count >= ARGO_MAX_RINGS_PER_DOMAIN )
+            {
+                ret = -ENOSPC;
+                break;
+            }
+
             ring_info = argo_ring_find_info(d, &ring.id);
 
             if ( !ring_info )
@@ -1357,7 +1370,10 @@ argo_register_ring(struct domain *d,
                 ret = update_tx_ptr ? argo_update_tx_ptr(ring_info, ring.tx_ptr)
                                     : argo_ring_map_page(ring_info, 0, NULL);
             if ( !ret )
+            {
                 ring_info->len = ring.len;
+                d->argo->ring_count++;
+            }
 
         } while ( 0 );
 
@@ -1698,6 +1714,7 @@ argo_init(struct domain *d)
         return -ENOMEM;
 
     rwlock_init(&argo->lock);
+    argo->ring_count = 0;
 
     for ( i = 0; i < ARGO_HTABLE_SIZE; ++i )
         INIT_HLIST_HEAD(&argo->ring_hash[i]);
