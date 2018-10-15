@@ -27,6 +27,7 @@
 #include <xsm/xsm.h>
 
 #define ARGO_MAX_RINGS_PER_DOMAIN       128U
+#define ARGO_MAX_NOTIFY_COUNT           256U
 
 DEFINE_XEN_GUEST_HANDLE(argo_pfn_t);
 DEFINE_XEN_GUEST_HANDLE(argo_addr_t);
@@ -1479,6 +1480,12 @@ argo_notify(struct domain *d,
             ret = copy_from_guest_errno(&ring_data, ring_data_hnd, 1);
             if ( ret )
                 break;
+
+            if ( ring_data.nent > ARGO_MAX_NOTIFY_COUNT )
+            {
+                ret = -EACCES;
+                break;
+            }
 
             {
                 /*
