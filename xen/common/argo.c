@@ -28,6 +28,10 @@
 DEFINE_XEN_GUEST_HANDLE(argo_addr_t);
 DEFINE_XEN_GUEST_HANDLE(argo_ring_t);
 
+/* Xen command line option to enable argo */
+static bool __read_mostly opt_argo_enabled = 0;
+boolean_param("argo", opt_argo_enabled);
+
 struct argo_pending_ent
 {
     struct hlist_node node;
@@ -223,6 +227,13 @@ do_argo_message_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg1,
     argo_dprintk("->do_argo_message_op(%d,%p,%p,%d,%d)\n", cmd,
                  (void *)arg1.p, (void *)arg2.p, (int) arg3, (int) arg4);
 
+    if ( unlikely(!opt_argo_enabled) )
+    {
+        rc = -ENOSYS;
+        argo_dprintk("<-do_argo_message_op()=%ld\n", rc);
+        return rc;
+    }
+
     domain_lock(d);
 
     switch (cmd)
@@ -244,6 +255,14 @@ argo_init(struct domain *d)
     evtchn_port_t port;
     int i;
     int rc;
+
+    if ( !opt_argo_enabled )
+    {
+        argo_dprintk("argo disabled, domid: %d\n", d->domain_id);
+        return 0;
+    }
+
+    argo_dprintk("argo init: domid: %d\n", d->domain_id);
 
     argo = xmalloc(struct argo_domain);
     if ( !argo )
