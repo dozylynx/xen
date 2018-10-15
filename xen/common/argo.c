@@ -1588,7 +1588,7 @@ do_argo_message_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg1,
     argo_dprintk("->do_argo_message_op(%d,%p,%p,%d,%d)\n", cmd,
                  (void *)arg1.p, (void *)arg2.p, (int) arg3, (int) arg4);
 
-    if ( unlikely(!opt_argo_enabled) )
+    if ( unlikely(!opt_argo_enabled || xsm_argo_enable(d)) )
     {
         rc = -ENOSYS;
         argo_dprintk("<-do_argo_message_op()=%ld\n", rc);
@@ -1685,7 +1685,7 @@ argo_init(struct domain *d)
     int i;
     int rc;
 
-    if ( !opt_argo_enabled )
+    if ( !opt_argo_enabled || xsm_argo_enable(d) )
     {
         argo_dprintk("argo disabled, domid: %d\n", d->domain_id);
         return 0;

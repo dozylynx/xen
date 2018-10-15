@@ -1718,6 +1718,12 @@ static int flask_domain_resource_map(struct domain *d)
 }
 
 #ifdef CONFIG_ARGO
+static int flask_argo_enable(struct domain *d)
+{
+    return avc_has_perm(domain_sid(d), SECINITSID_XEN, SECCLASS_ARGO,
+                        ARGO__ENABLE, NULL);
+}
+
 static int flask_argo_register_single_source(struct domain *d,
                                              struct domain *t)
 {
@@ -1873,6 +1879,7 @@ static struct xsm_operations flask_ops = {
     .xen_version = flask_xen_version,
     .domain_resource_map = flask_domain_resource_map,
 #ifdef CONFIG_ARGO
+    .argo_enable = flask_argo_enable,
     .argo_register_single_source = flask_argo_register_single_source,
     .argo_register_any_source = flask_argo_register_any_source,
     .argo_send = flask_argo_send,

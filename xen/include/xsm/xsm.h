@@ -182,6 +182,7 @@ struct xsm_operations {
     int (*xen_version) (uint32_t cmd);
     int (*domain_resource_map) (struct domain *d);
 #ifdef CONFIG_ARGO
+    int (*argo_enable) (struct domain *d);
     int (*argo_register_single_source) (struct domain *d, struct domain *t);
     int (*argo_register_any_source) (struct domain *d);
     int (*argo_send) (struct domain *d, struct domain *t);
@@ -704,6 +705,11 @@ static inline int xsm_domain_resource_map(xsm_default_t def, struct domain *d)
 }
 
 #ifdef CONFIG_ARGO
+static inline xsm_argo_enable(struct domain *d)
+{
+    return xsm_ops->argo_enable(d);
+}
+
 static inline xsm_argo_register_single_source(struct domain *d, struct domain *t)
 {
     return xsm_ops->argo_register_single_source(d, t);
