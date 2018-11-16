@@ -150,6 +150,9 @@ struct argo_ring_message_header
 #endif
 };
 
+#define ARGO_SIGNAL_METHOD_EVTCHN      1
+#define ARGO_SIGNAL_METHOD_VIRQ        2
+
 /*
  * Hypercall operations
  */

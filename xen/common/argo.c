@@ -181,18 +181,51 @@ static DEFINE_RWLOCK(argo_lock); /* L1 */
 #endif
 
 /*
- * Event channel
+ * Signalling
  */
+
+static unsigned int argo_signal_method(const struct domain *d)
+{
+    unsigned int method;
+#ifdef CONFIG_X86
+    if ( is_hvm_domain(d) )
+        method = ARGO_SIGNAL_METHOD_VIRQ;
+    else
+        method = ARGO_SIGNAL_METHOD_EVTCHN;
+#else
+    method = ARGO_SIGNAL_METHOD_VIRQ;
+#endif
+    return method;
+}
 
 static void
 argo_signal_domain(struct domain *d)
 {
-    argo_dprintk("signalling domid:%d\n", d->domain_id);
+    unsigned int method = argo_signal_method(d);
 
     if ( !d->argo ) /* This can happen if the domain is being destroyed */
         return;
 
-    evtchn_send(d, d->argo->evtchn_port);
+    argo_dprintk("signalling domid:%d via method:%u\n", d->domain_id, method);
+
+    switch ( method )
+    {
+        case ARGO_SIGNAL_METHOD_EVTCHN:
+        {
+            evtchn_send(d, d->argo->evtchn_port);
+            break;
+        }
+        case ARGO_SIGNAL_METHOD_VIRQ:
+        {
+            send_guest_global_virq(d, VIRQ_ARGO);
+            break;
+        }
+        default:
+        {
+            BUG();
+            break;
+        }
+    }
 }
 
 static void
