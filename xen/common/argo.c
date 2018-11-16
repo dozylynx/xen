@@ -23,6 +23,7 @@
 #include <xen/event.h>
 #include <xen/domain_page.h>
 #include <xen/guest_access.h>
+#include <xen/nospec.h>
 #include <xen/time.h>
 #include <xsm/xsm.h>
 
@@ -1094,7 +1095,7 @@ argo_ring_find_info(const struct domain *d, const struct argo_ring_id *id)
 
     ASSERT(rw_is_locked(&d->argo->lock));
 
-    hash = argo_hash_fn(id);
+    hash = array_index_nospec(argo_hash_fn(id), ARGO_HTABLE_SIZE);
 
     argo_dprintk("d->argo=%p, d->argo->ring_hash[%d]=%p id=%p\n",
                  d->argo, hash, d->argo->ring_hash[hash].first, id);
@@ -1349,7 +1350,8 @@ argo_register_ring(struct domain *d,
                 ring_info->id = ring.id;
                 INIT_HLIST_HEAD(&ring_info->pending);
 
-                hash = argo_hash_fn(&ring_info->id);
+                hash = array_index_nospec(argo_hash_fn(&ring_info->id),
+                                          ARGO_HTABLE_SIZE);
                 hlist_add_head(&ring_info->node, &d->argo->ring_hash[hash]);
 
                 printk(XENLOG_INFO "argo: vm%u registering ring (vm%u:%x vm%d)\n",
