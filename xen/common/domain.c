@@ -88,6 +88,11 @@ static void __domain_finalise_shutdown(struct domain *d)
         if ( !v->paused_for_shutdown )
             return;
 
+#ifdef CONFIG_ARGO
+    if ( d->shutdown_code == SHUTDOWN_suspend )
+        argo_shutdown_for_suspend(d);
+#endif
+
     d->is_shut_down = 1;
     if ( (d->shutdown_code == SHUTDOWN_suspend) && d->suspend_evtchn )
         evtchn_send(d, d->suspend_evtchn);
@@ -856,6 +861,10 @@ void domain_resume(struct domain *d)
     spin_unlock(&d->shutdown_lock);
 
     domain_unpause(d);
+
+#ifdef CONFIG_ARGO
+    argo_resume(d);
+#endif
 }
 
 int vcpu_start_shutdown_deferral(struct vcpu *v)

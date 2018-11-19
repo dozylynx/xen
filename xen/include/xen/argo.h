@@ -26,5 +26,7 @@ struct argo_domain;
 
 int argo_init(struct domain *d);
 void argo_destroy(struct domain *d);
+void argo_shutdown_for_suspend(struct domain *d);
+void argo_resume(struct domain *d);
 
 #endif

@@ -840,6 +840,16 @@ static void argo_ring_remove_mfns(const struct domain *d,
 }
 
 static void
+argo_ring_reset(struct domain *d, struct argo_ring_info *ring_info)
+{
+    ASSERT(rw_is_write_locked(&d->argo->lock));
+
+    argo_ring_remove_mfns(d, ring_info);
+    ring_info->len = 0;
+    ring_info->tx_ptr = 0;
+}
+
+static void
 argo_ring_remove_info(struct domain *d, struct argo_ring_info *ring_info)
 {
     ASSERT(rw_is_write_locked(&d->argo->lock));
@@ -1831,4 +1841,63 @@ argo_destroy(struct domain *d)
      * use the inherited authorizations to transmit that were issued to this
      * domain.
      */
+}
+
+void
+argo_shutdown_for_suspend(struct domain *d)
+{
+    int i;
+
+    if ( !d )
+        return;
+
+    if ( get_domain(d) )
+    {
+        read_lock(&argo_lock);
+
+        if ( d->argo )
+        {
+            write_lock(&d->argo->lock);
+
+            for ( i = 0; i < ARGO_HTABLE_SIZE; i++ )
+            {
+                struct hlist_node *node, *next;
+                struct argo_ring_info *ring_info;
+                hlist_for_each_entry_safe(ring_info, node,
+                                          next, &d->argo->ring_hash[i], node)
+                argo_ring_reset(d, ring_info);
+            }
+
+            write_unlock(&d->argo->lock);
+        }
+
+        read_unlock(&argo_lock);
+
+        put_domain(d);
+    }
+}
+
+void
+argo_resume(struct domain *d)
+{
+    bool send_wakeup;
+
+    if ( !d )
+        return;
+
+    if ( !get_domain(d) )
+        return;
+
+    read_lock(&argo_lock);
+
+    read_lock(&d->argo->lock);
+    send_wakeup = ( d->argo->ring_count > 0 );
+    read_unlock(&d->argo->lock);
+
+    if ( send_wakeup )
+        argo_signal_domain(d);
+
+    read_unlock(&argo_lock);
+
+    put_domain(d);
 }
