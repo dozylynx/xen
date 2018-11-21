@@ -20,6 +20,7 @@
 #define __XEN_PUBLIC_ARGO_H__
 
 #include "xen.h"
+#include "event_channel.h"
 
 #define ARGO_RING_MAGIC      0xbd67e163e7777f2fULL
 #define ARGO_RING_DATA_MAGIC 0xcce4d30fbc82e92aULL
@@ -153,6 +154,18 @@ struct argo_ring_message_header
 #define ARGO_SIGNAL_METHOD_EVTCHN      1
 #define ARGO_SIGNAL_METHOD_VIRQ        2
 
+typedef struct argo_get_config
+{
+    uint32_t signal_method;
+    union
+    {
+        evtchn_port_t evtchn;
+        uint32_t virq;
+    } signal;
+    uint32_t reserved;
+} argo_get_config_t;
+DEFINE_XEN_GUEST_HANDLE(argo_get_config_t);
+
 /*
  * Hypercall operations
  */
@@ -243,6 +256,21 @@ struct argo_ring_message_header
  * arg4: 0 (ZERO)
  */
 #define ARGO_MESSAGE_OP_notify              4
+
+/*
+ * ARGO_MESSAGE_OP_get_config
+ *
+ * Queries Xen for argo configuration values.
+ *
+ * Used by a guest to obtain the signal method in use for Argo notifications
+ * and the event channel port or isa irq in use.
+ *
+ * arg1: XEN_GUEST_HANDLE(argo_get_config_t)
+ * arg2: NULL
+ * arg3: 0 (ZERO)
+ * arg4: 0 (ZERO)
+ */
+#define ARGO_MESSAGE_OP_get_config          6
 
 /* The maximum size of a guest message that may be sent on an Argo ring. */
 #define ARGO_MAX_MSG_SIZE ((ARGO_MAX_RING_SIZE) - \

@@ -1656,6 +1656,46 @@ argo_sendv(struct domain *src_d, const argo_addr_t *src_addr,
     return ( ret < 0 ) ? ret : len;
 }
 
+static void
+argo_get_config(struct domain *d, argo_get_config_t *get_config)
+{
+    unsigned int method = argo_signal_method(d);
+
+    get_config->signal_method = method;
+
+    switch ( method )
+    {
+        case ARGO_SIGNAL_METHOD_EVTCHN:
+        {
+            read_lock(&argo_lock);
+            read_lock(&d->argo->lock);
+
+            get_config->signal.evtchn = d->argo->evtchn_port;
+
+            read_unlock(&d->argo->lock);
+            read_unlock(&argo_lock);
+
+            argo_dprintk("signal for dom:%d evtchn %u\n", d->domain_id,
+                         get_config->signal.evtchn);
+
+            break;
+        }
+        case ARGO_SIGNAL_METHOD_VIRQ:
+        {
+            get_config->signal.virq = VIRQ_ARGO;
+
+            argo_dprintk("signal for dom:%d virq %u\n", d->domain_id,
+                         get_config->signal.virq);
+            break;
+        }
+        default:
+        {
+            BUG();
+            break;
+        }
+    }
+}
+
 long
 do_argo_message_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg1,
                    XEN_GUEST_HANDLE_PARAM(void) arg2,
@@ -1744,6 +1784,23 @@ do_argo_message_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg1,
                    guest_handle_cast(arg1, argo_ring_data_t);
 
         rc = argo_notify(d, ring_data_hnd);
+        break;
+    }
+    case ARGO_MESSAGE_OP_get_config:
+    {
+        XEN_GUEST_HANDLE_PARAM(argo_get_config_t) get_config_hnd =
+                   guest_handle_cast(arg1, argo_get_config_t);
+        argo_get_config_t get_config;
+
+        if ( unlikely(!guest_handle_okay(get_config_hnd, 1)) )
+            break;
+
+        argo_get_config(d, &get_config);
+
+        if ( __copy_to_guest(get_config_hnd, &get_config, 1) )
+            break;
+
+        rc = 0;
         break;
     }
     default:
