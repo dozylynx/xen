@@ -86,6 +86,9 @@ void notify_via_xen_event_channel(struct domain *ld, int lport);
 /* Inject an event channel notification into the guest */
 void arch_evtchn_inject(struct vcpu *v);
 
+/* Allocate an IPI event channel on vcpu0 for the specified domain */
+long evtchn_bind_ipi_vcpu0_domain(struct domain *d, evtchn_port_t *out_port);
+
 /*
  * Internal event channel object storage.
  *

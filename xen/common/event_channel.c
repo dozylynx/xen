@@ -411,16 +411,11 @@ int evtchn_bind_virq(evtchn_bind_virq_t *bind, evtchn_port_t port)
 }
 
 
-static long evtchn_bind_ipi(evtchn_bind_ipi_t *bind)
+static long evtchn_bind_ipi_domain(struct domain *d, evtchn_bind_ipi_t *bind)
 {
     struct evtchn *chn;
-    struct domain *d = current->domain;
     int            port, vcpu = bind->vcpu;
     long           rc = 0;
-
-    if ( (vcpu < 0) || (vcpu >= d->max_vcpus) ||
-         (d->vcpu[vcpu] == NULL) )
-        return -ENOENT;
 
     spin_lock(&d->event_lock);
 
@@ -441,6 +436,34 @@ static long evtchn_bind_ipi(evtchn_bind_ipi_t *bind)
 
  out:
     spin_unlock(&d->event_lock);
+
+    return rc;
+}
+
+
+static long evtchn_bind_ipi(evtchn_bind_ipi_t *bind)
+{
+    struct domain *d = current->domain;
+    int         vcpu = bind->vcpu;
+
+    if ( (vcpu < 0) || (vcpu >= d->max_vcpus) ||
+         (d->vcpu[vcpu] == NULL) )
+        return -ENOENT;
+
+    return evtchn_bind_ipi_domain(d, bind);
+}
+
+long evtchn_bind_ipi_vcpu0_domain(struct domain *d, evtchn_port_t *out_port)
+{
+    evtchn_bind_ipi_t bind_ipi;
+    long              rc;
+
+    bind_ipi.vcpu = 0;
+
+    rc = evtchn_bind_ipi_domain(d, &bind_ipi);
+
+    if ( !rc )
+        *out_port = bind_ipi.port;
 
     return rc;
 }
