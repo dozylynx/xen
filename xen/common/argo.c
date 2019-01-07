@@ -1261,6 +1261,7 @@ fill_ring_data(const struct domain *currd,
     xen_argo_ring_data_ent_t ent;
     struct domain *dst_d;
     struct argo_ring_info *ring_info;
+    int ret;
 
     ASSERT(currd == current->domain);
     ASSERT(LOCKING_Read_L1);
@@ -1278,6 +1279,17 @@ fill_ring_data(const struct domain *currd,
     {
         if ( dst_d->argo )
         {
+            /*
+             * Don't supply information about rings that a guest is not
+             * allowed to send to.
+             */
+            ret = xsm_argo_send(currd, dst_d);
+            if ( ret )
+            {
+                put_domain(dst_d);
+                return ret;
+            }
+
             read_lock(&dst_d->argo->rings_L2_rwlock);
 
             ring_info = find_ring_info_by_match(dst_d, ent.ring.aport,
