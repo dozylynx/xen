@@ -26,6 +26,7 @@
 #include <xen/nospec.h>
 #include <xen/sched.h>
 #include <xen/time.h>
+#include <xsm/xsm.h>
 
 #include <public/argo.h>
 
@@ -1589,11 +1590,10 @@ register_ring(struct domain *currd,
 
     if ( reg.partner_id == XEN_ARGO_DOMID_ANY )
     {
-        if ( !opt_argo_mac_permissive )
-        {
-            ret = -EPERM;
+        ret = opt_argo_mac_permissive ? xsm_argo_register_any_source(currd) :
+                                        -EPERM;
+        if ( ret )
             goto out_unlock;
-        }
     }
     else
     {
@@ -1602,6 +1602,13 @@ register_ring(struct domain *currd,
         {
             argo_dprintk("!dst_d, ESRCH\n");
             ret = -ESRCH;
+            goto out_unlock;
+        }
+
+        ret = xsm_argo_register_single_source(currd, dst_d);
+        if ( ret )
+        {
+            put_domain(dst_d);
             goto out_unlock;
         }
 
