@@ -151,3 +151,4 @@
 ?	argo_addr			argo.h
 ?	argo_ring			argo.h
 ?	argo_register_ring		argo.h
+?	argo_unregister_ring		argo.h
