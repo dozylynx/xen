@@ -23,3 +23,22 @@ CHECK_argo_addr;
 CHECK_argo_register_ring;
 CHECK_argo_ring;
 CHECK_argo_unregister_ring;
+
+/*
+ * Disable strict type checking in this compat validation macro for the
+ * following struct checks because it cannot handle fields within structs that
+ * have types that differ in the compat versus non-compat structs.
+ * Replace it with a field size check which is sufficient here.
+ */
+
+#undef CHECK_FIELD_COMMON_
+#define CHECK_FIELD_COMMON_(k, name, n, f) \
+static inline int __maybe_unused name(k xen_ ## n *x, k compat_ ## n *c) \
+{ \
+    BUILD_BUG_ON(offsetof(k xen_ ## n, f) != \
+                 offsetof(k compat_ ## n, f)); \
+    return sizeof(x->f) == sizeof(c->f); \
+}
+
+CHECK_argo_send_addr;
+CHECK_argo_iov;
