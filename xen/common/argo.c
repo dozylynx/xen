@@ -1172,6 +1172,17 @@ fill_ring_data(const struct domain *currd,
     {
         if ( dst_d->argo )
         {
+            /*
+             * Don't supply information about rings that a guest is not
+             * allowed to send to.
+             */
+            ret = xsm_argo_send(currd, dst_d);
+            if ( ret )
+            {
+                put_domain(dst_d);
+                goto out;
+            }
+
             read_lock(&dst_d->argo->lock);
 
             ring_info = ring_find_info_by_match(dst_d, ent.ring.port,
