@@ -41,6 +41,34 @@
 #define XEN_ARGO_MAX_RING_SIZE  (0x1000000ULL)
 
 /*
+ * XEN_ARGO_MAXIOV : maximum number of iovs accepted in a single sendv.
+ * Rationale for the value:
+ * A low value since the full array of iov structs is read onto the hypervisor
+ * stack to work with while processing the message data.
+ * The Linux argo driver never passes more than two iovs.
+ *
+ * This value should not exceed 128 to ensure that the total amount of data
+ * posted in a single Argo sendv operation cannot exceed 2^31 bytes, to reduce
+ * risk of integer overflow defects:
+ * Each argo iov can hold ~ 2^24 bytes, so XEN_ARGO_MAXIOV <= 2^(31-24),
+ * ie. keep XEN_ARGO_MAXIOV <= 128.
+*/
+#define XEN_ARGO_MAXIOV          8U
+
+DEFINE_XEN_GUEST_HANDLE(uint8_t);
+
+typedef struct xen_argo_iov
+{
+#ifdef XEN_GUEST_HANDLE_64
+    XEN_GUEST_HANDLE_64(uint8_t) iov_hnd;
+#else
+    uint64_t iov_hnd;
+#endif
+    uint32_t iov_len;
+    uint32_t pad;
+} xen_argo_iov_t;
+
+/*
  * Page descriptor: encoding both page address and size in a 64-bit value.
  * Intended to allow ABI to support use of different granularity pages.
  * example of how to populate:
@@ -57,6 +85,12 @@ typedef struct xen_argo_addr
     domid_t domain_id;
     uint16_t pad;
 } xen_argo_addr_t;
+
+typedef struct xen_argo_send_addr
+{
+    xen_argo_addr_t src;
+    xen_argo_addr_t dst;
+} xen_argo_send_addr_t;
 
 typedef struct xen_argo_ring
 {
@@ -146,5 +180,31 @@ struct xen_argo_ring_message_header
  * arg4: 0 (ZERO)
  */
 #define XEN_ARGO_OP_unregister_ring     2
+
+/*
+ * XEN_ARGO_OP_sendv
+ *
+ * Send a list of buffers contained in iovs.
+ *
+ * The send address struct specifies the source and destination addresses
+ * for the message being sent, which are used to find the destination ring:
+ * Xen first looks for a most-specific match with a registered ring with
+ *  (id.addr == dst) and (id.partner == sending_domain) ;
+ * if that fails, it then looks for a wildcard match (aka multicast receiver)
+ * where (id.addr == dst) and (id.partner == DOMID_ANY).
+ *
+ * For each iov entry, send iov_len bytes from iov_base to the destination ring.
+ * If insufficient space exists in the destination ring, it will return -EAGAIN
+ * and Xen will notify the caller when sufficient space becomes available.
+ *
+ * The message type is a 32-bit data field available to communicate message
+ * context data (eg. kernel-to-kernel, rather than application layer).
+ *
+ * arg1: XEN_GUEST_HANDLE(xen_argo_send_addr_t) source and dest addresses
+ * arg2: XEN_GUEST_HANDLE(xen_argo_iov_t) iovs
+ * arg3: unsigned long niov
+ * arg4: unsigned long message type
+ */
+#define XEN_ARGO_OP_sendv               3
 
 #endif

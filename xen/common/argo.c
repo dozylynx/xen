@@ -29,14 +29,21 @@
 #include <public/argo.h>
 
 #define MAX_RINGS_PER_DOMAIN            128U
+#define MAX_PENDING_PER_RING             32U
 
 /* All messages on the ring are padded to a multiple of the slot size. */
 #define ROUNDUP_MESSAGE(a) (ROUNDUP((a), XEN_ARGO_MSG_SLOT_SIZE))
 
+/* The maximum size of a message that may be sent on the largest Argo ring. */
+#define MAX_ARGO_MESSAGE_SIZE ((XEN_ARGO_MAX_RING_SIZE) - \
+        (sizeof(struct xen_argo_ring_message_header)) - ROUNDUP_MESSAGE(1))
+
 DEFINE_XEN_GUEST_HANDLE(xen_argo_addr_t);
+DEFINE_XEN_GUEST_HANDLE(xen_argo_iov_t);
 DEFINE_XEN_GUEST_HANDLE(xen_argo_page_descr_t);
 DEFINE_XEN_GUEST_HANDLE(xen_argo_register_ring_t);
 DEFINE_XEN_GUEST_HANDLE(xen_argo_ring_t);
+DEFINE_XEN_GUEST_HANDLE(xen_argo_send_addr_t);
 DEFINE_XEN_GUEST_HANDLE(xen_argo_unregister_ring_t);
 
 /* Xen command line option to enable argo */
@@ -250,6 +257,14 @@ hash_index(const struct argo_ring_id *id)
 }
 
 static void
+signal_domain(struct domain *d)
+{
+    argo_dprintk("signalling domid:%d\n", d->domain_id);
+
+    send_guest_global_virq(d, VIRQ_ARGO_MESSAGE);
+}
+
+static void
 ring_unmap(struct argo_ring_info *ring_info)
 {
     unsigned int i;
@@ -342,6 +357,413 @@ update_tx_ptr(struct argo_ring_info *ring_info, uint32_t tx_ptr)
     smp_wmb();
 }
 
+static int
+memcpy_to_guest_ring(struct argo_ring_info *ring_info, uint32_t offset,
+                     const void *src, XEN_GUEST_HANDLE(uint8_t) src_hnd,
+                     uint32_t len)
+{
+    unsigned int mfns_index = offset >> PAGE_SHIFT;
+    void *dst;
+    int ret;
+    unsigned int src_offset = 0;
+
+    ASSERT(spin_is_locked(&ring_info->lock));
+
+    offset &= ~PAGE_MASK;
+
+    if ( (len > XEN_ARGO_MAX_RING_SIZE) || (offset > XEN_ARGO_MAX_RING_SIZE) )
+        return -EFAULT;
+
+    while ( (offset + len) > PAGE_SIZE )
+    {
+        unsigned int head_len = PAGE_SIZE - offset;
+
+        ret = ring_map_page(ring_info, mfns_index, &dst);
+        if ( ret )
+            return ret;
+
+        if ( src )
+        {
+            memcpy(dst + offset, src + src_offset, head_len);
+            src_offset += head_len;
+        }
+        else
+        {
+            ret = copy_from_guest(dst + offset, src_hnd, head_len) ?
+                    -EFAULT : 0;
+            if ( ret )
+                return ret;
+
+            guest_handle_add_offset(src_hnd, head_len);
+        }
+
+        mfns_index++;
+        len -= head_len;
+        offset = 0;
+    }
+
+    ret = ring_map_page(ring_info, mfns_index, &dst);
+    if ( ret )
+    {
+        argo_dprintk("argo: ring (vm%u:%x vm%d) %p attempted to map page"
+                     " %d of %d\n", ring_info->id.domain_id, ring_info->id.port,
+                     ring_info->id.partner_id, ring_info, mfns_index,
+                     ring_info->nmfns);
+        return ret;
+    }
+
+    if ( src )
+        memcpy(dst + offset, src + src_offset, len);
+    else
+        ret = copy_from_guest(dst + offset, src_hnd, len) ? -EFAULT : 0;
+
+    return ret;
+}
+
+/*
+ * Use this with caution: rx_ptr is under guest control and may be bogus.
+ * See get_sanitized_ring for a safer alternative.
+ */
+static int
+get_rx_ptr(struct argo_ring_info *ring_info, uint32_t *rx_ptr)
+{
+    void *src;
+    xen_argo_ring_t *ringp;
+    int ret;
+
+    ASSERT(spin_is_locked(&ring_info->lock));
+
+    if ( !ring_info->nmfns || ring_info->nmfns < ring_info->npage )
+        return -EINVAL;
+
+    ret = ring_map_page(ring_info, 0, &src);
+    if ( ret )
+        return ret;
+
+    ringp = (xen_argo_ring_t *)src;
+
+    *rx_ptr = read_atomic(&ringp->rx_ptr);
+
+    return 0;
+}
+
+/*
+ * get_sanitized_ring creates a modified copy of the ring pointers where
+ * the rx_ptr is rounded up to ensure it is aligned, and then ring
+ * wrap is handled. Simplifies safe use of the rx_ptr for available
+ * space calculation.
+ */
+static int
+get_sanitized_ring(xen_argo_ring_t *ring, struct argo_ring_info *ring_info)
+{
+    uint32_t rx_ptr;
+    int ret;
+
+    ret = get_rx_ptr(ring_info, &rx_ptr);
+    if ( ret )
+        return ret;
+
+    ring->tx_ptr = ring_info->tx_ptr;
+
+    rx_ptr = ROUNDUP_MESSAGE(rx_ptr);
+    if ( rx_ptr >= ring_info->len )
+        rx_ptr = 0;
+
+    ring->rx_ptr = rx_ptr;
+    return 0;
+}
+
+/*
+ * iov_count returns its count on success via an out variable to avoid
+ * potential for a negative return value to be used incorrectly
+ * (eg. coerced into an unsigned variable resulting in a large incorrect value)
+ */
+static int
+iov_count(const xen_argo_iov_t *piov, unsigned long niov, uint32_t *count)
+{
+    uint32_t sum_iov_lens = 0;
+
+    if ( niov > XEN_ARGO_MAXIOV )
+        return -EINVAL;
+
+    while ( niov-- )
+    {
+        /* valid iovs must have the padding field set to zero */
+        if ( piov->pad )
+        {
+            argo_dprintk("invalid iov: padding is not zero\n");
+            return -EINVAL;
+        }
+
+        /* check each to protect sum against integer overflow */
+        if ( piov->iov_len > XEN_ARGO_MAX_RING_SIZE )
+        {
+            argo_dprintk("invalid iov_len: too big (%u)>%llu\n",
+                         piov->iov_len, XEN_ARGO_MAX_RING_SIZE);
+            return -EINVAL;
+        }
+
+        sum_iov_lens += piov->iov_len;
+
+        /*
+         * Again protect sum from integer overflow
+         * and ensure total msg size will be within bounds.
+         */
+        if ( sum_iov_lens > MAX_ARGO_MESSAGE_SIZE )
+        {
+            argo_dprintk("invalid iov series: total message too big\n");
+            return -EMSGSIZE;
+        }
+
+        piov++;
+    }
+
+    *count = sum_iov_lens;
+
+    return 0;
+}
+
+static int
+ringbuf_insert(struct domain *d, struct argo_ring_info *ring_info,
+               const struct argo_ring_id *src_id,
+               XEN_GUEST_HANDLE_PARAM(xen_argo_iov_t) iovs_hnd,
+               unsigned long niov, uint32_t message_type,
+               unsigned long *out_len)
+{
+    xen_argo_ring_t ring;
+    struct xen_argo_ring_message_header mh = { 0 };
+    int32_t sp;
+    int32_t ret;
+    uint32_t len = 0;
+    xen_argo_iov_t iovs[XEN_ARGO_MAXIOV];
+    xen_argo_iov_t *piov;
+    XEN_GUEST_HANDLE(uint8_t) NULL_hnd =
+       guest_handle_from_param(guest_handle_from_ptr(NULL, uint8_t), uint8_t);
+
+    ASSERT(spin_is_locked(&ring_info->lock));
+
+    ret = __copy_from_guest(iovs, iovs_hnd, niov) ? -EFAULT : 0;
+    if ( ret )
+        goto out;
+
+    /*
+     * Obtain the total size of data to transmit -- sets the 'len' variable
+     * -- and sanity check that the iovs conform to size and number limits.
+     * Enforced below: no more than 'len' bytes of guest data
+     * (plus the message header) will be sent in this operation.
+     */
+    ret = iov_count(iovs, niov, &len);
+    if ( ret )
+        goto out;
+
+    /*
+     * Size bounds check against ring size and static maximum message limit.
+     * The message must not fill the ring; there must be at least one slot
+     * remaining so we can distinguish a full ring from an empty one.
+     */
+    if ( ((ROUNDUP_MESSAGE(len) +
+            sizeof(struct xen_argo_ring_message_header)) >= ring_info->len) ||
+         (len > MAX_ARGO_MESSAGE_SIZE) )
+    {
+        ret = -EMSGSIZE;
+        goto out;
+    }
+
+    ret = get_sanitized_ring(&ring, ring_info);
+    if ( ret )
+        goto out;
+
+    argo_dprintk("ring.tx_ptr=%d ring.rx_ptr=%d ring len=%d"
+                 " ring_info->tx_ptr=%d\n",
+                 ring.tx_ptr, ring.rx_ptr, ring_info->len, ring_info->tx_ptr);
+
+    if ( ring.rx_ptr == ring.tx_ptr )
+        sp = ring_info->len;
+    else
+    {
+        sp = ring.rx_ptr - ring.tx_ptr;
+        if ( sp < 0 )
+            sp += ring_info->len;
+    }
+
+    /*
+     * Size bounds check against currently available space in the ring.
+     * Again: the message must not fill the ring leaving no space remaining.
+     */
+    if ( (ROUNDUP_MESSAGE(len) +
+            sizeof(struct xen_argo_ring_message_header)) >= sp )
+    {
+        argo_dprintk("EAGAIN\n");
+        ret = -EAGAIN;
+        goto out;
+    }
+
+    mh.len = len + sizeof(struct xen_argo_ring_message_header);
+    mh.source.port = src_id->port;
+    mh.source.domain_id = src_id->domain_id;
+    mh.message_type = message_type;
+
+    /*
+     * For this copy to the guest ring, tx_ptr is always 16-byte aligned
+     * and the message header is 16 bytes long.
+     */
+    BUILD_BUG_ON(
+        sizeof(struct xen_argo_ring_message_header) != ROUNDUP_MESSAGE(1));
+
+    /*
+     * First data write into the destination ring: fixed size, message header.
+     * This cannot overrun because the available free space (value in 'sp')
+     * is checked above and must be at least this size.
+     */
+    ret = memcpy_to_guest_ring(ring_info, ring.tx_ptr + sizeof(xen_argo_ring_t),
+                               &mh, NULL_hnd, sizeof(mh));
+    if ( ret )
+    {
+        gprintk(XENLOG_ERR,
+                "argo: failed to write message header to ring (vm%u:%x vm%d)\n",
+                ring_info->id.domain_id, ring_info->id.port,
+                ring_info->id.partner_id);
+
+        goto out;
+    }
+
+    ring.tx_ptr += sizeof(mh);
+    if ( ring.tx_ptr == ring_info->len )
+        ring.tx_ptr = 0;
+
+    piov = iovs;
+
+    while ( niov-- )
+    {
+        XEN_GUEST_HANDLE_64(uint8_t) buf_hnd = piov->iov_hnd;
+        uint32_t iov_len = piov->iov_len;
+
+        /* If no data is provided in this iov, moan and skip on to the next */
+        if ( !iov_len )
+        {
+            gprintk(XENLOG_ERR,
+                    "argo: no data iov_len=0 iov_hnd=%p ring (vm%u:%x vm%d)\n",
+                    buf_hnd.p, ring_info->id.domain_id, ring_info->id.port,
+                    ring_info->id.partner_id);
+
+            piov++;
+            continue;
+        }
+
+        if ( unlikely(!guest_handle_okay(buf_hnd, iov_len)) )
+        {
+            gprintk(XENLOG_ERR,
+                    "argo: bad iov handle [%p, %"PRIx32"] (vm%u:%x vm%d)\n",
+                    buf_hnd.p, iov_len,
+                    ring_info->id.domain_id, ring_info->id.port,
+                    ring_info->id.partner_id);
+
+            ret = -EFAULT;
+            goto out;
+        }
+
+        sp = ring_info->len - ring.tx_ptr;
+
+        /* Check: iov data size versus free space at the tail of the ring */
+        if ( iov_len > sp )
+        {
+            /*
+             * Second possible data write: ring-tail-wrap-write.
+             * Populate the ring tail and update the internal tx_ptr to handle
+             * wrapping at the end of ring.
+             * Size of data written here: sp
+             * which is the exact full amount of free space available at the
+             * tail of the ring, so this cannot overrun.
+             */
+            ret = memcpy_to_guest_ring(ring_info,
+                                       ring.tx_ptr + sizeof(xen_argo_ring_t),
+                                       NULL, buf_hnd, sp);
+            if ( ret )
+            {
+                gprintk(XENLOG_ERR,
+                        "argo: failed to copy {%p, %"PRIx32"} (vm%u:%x vm%d)\n",
+                        buf_hnd.p, sp,
+                        ring_info->id.domain_id, ring_info->id.port,
+                        ring_info->id.partner_id);
+
+                goto out;
+            }
+
+            ring.tx_ptr = 0;
+            iov_len -= sp;
+            guest_handle_add_offset(buf_hnd, sp);
+
+            ASSERT(iov_len <= ring_info->len);
+        }
+
+        /*
+         * Third possible data write: all data remaining for this iov.
+         * Size of data written here: iov_len
+         *
+         * Case 1: if the ring-tail-wrap-write above was performed, then
+         *         iov_len has been decreased by 'sp' and ring.tx_ptr is zero.
+         *
+         *    We know from checking the result of iov_count:
+         *      len + sizeof(message_header) <= ring_info->len
+         *    We also know that len is the total of summing all iov_lens, so:
+         *       iov_len <= len
+         *    so by transitivity:
+         *       iov_len <= len <= (ring_info->len - sizeof(msgheader))
+         *    and therefore:
+         *       (iov_len + sizeof(msgheader) <= ring_info->len) &&
+         *       (ring.tx_ptr == 0)
+         *    so this write cannot overrun here.
+         *
+         * Case 2: ring-tail-wrap-write above was not performed
+         *    -> so iov_len is the guest-supplied value and: (iov_len <= sp)
+         *    ie. less than available space at the tail of the ring:
+         *        so this write cannot overrun.
+         */
+        ret = memcpy_to_guest_ring(ring_info,
+                                   ring.tx_ptr + sizeof(xen_argo_ring_t),
+                                   NULL, buf_hnd, iov_len);
+        if ( ret )
+        {
+            gprintk(XENLOG_ERR,
+                    "argo: failed to copy [%p, %"PRIx32"] (vm%u:%x vm%d)\n",
+                    buf_hnd.p, iov_len, ring_info->id.domain_id,
+                    ring_info->id.port, ring_info->id.partner_id);
+
+            goto out;
+        }
+
+        ring.tx_ptr += iov_len;
+
+        if ( ring.tx_ptr == ring_info->len )
+            ring.tx_ptr = 0;
+
+        piov++;
+    }
+
+    ring.tx_ptr = ROUNDUP_MESSAGE(ring.tx_ptr);
+
+    if ( ring.tx_ptr >= ring_info->len )
+        ring.tx_ptr -= ring_info->len;
+
+    update_tx_ptr(ring_info, ring.tx_ptr);
+
+ out:
+    /*
+     * At this point it is possible to unmap the ring_info, ie:
+     *   ring_unmap(ring_info);
+     * but performance should be improved by not doing so, and retaining
+     * the mapping.
+     * An XSM policy control over level of confidentiality required
+     * versus performance cost could be added to decide that here.
+     * See the similar comment in ring_map_page re: write-only mappings.
+     */
+
+    if ( !ret )
+        *out_len = len;
+
+    return ret;
+}
+
 static void
 wildcard_pending_list_remove(domid_t domain_id, struct pending_ent *ent)
 {
@@ -353,6 +775,22 @@ wildcard_pending_list_remove(domid_t domain_id, struct pending_ent *ent)
     {
         spin_lock(&d->argo->wildcard_lock);
         hlist_del(&ent->wildcard_node);
+        spin_unlock(&d->argo->wildcard_lock);
+    }
+    put_domain(d);
+}
+
+static void
+wildcard_pending_list_insert(domid_t domain_id, struct pending_ent *ent)
+{
+    struct domain *d = get_domain_by_id(domain_id);
+    if ( !d )
+        return;
+
+    if ( d->argo )
+    {
+        spin_lock(&d->argo->wildcard_lock);
+        hlist_add_head(&ent->wildcard_node, &d->argo->wildcard_pend_list);
         spin_unlock(&d->argo->wildcard_lock);
     }
     put_domain(d);
@@ -372,6 +810,67 @@ pending_remove_all(struct argo_ring_info *ring_info)
         xfree(ent);
     }
     ring_info->npending = 0;
+}
+
+static int
+pending_queue(struct argo_ring_info *ring_info, domid_t src_id,
+              unsigned int len)
+{
+    struct pending_ent *ent;
+
+    ASSERT(spin_is_locked(&ring_info->lock));
+
+    if ( ring_info->npending >= MAX_PENDING_PER_RING )
+        return -ENOSPC;
+
+    ent = xmalloc(struct pending_ent);
+
+    if ( !ent )
+        return -ENOMEM;
+
+    ent->len = len;
+    ent->domain_id = src_id;
+    ent->ring_info = ring_info;
+
+    if ( ring_info->id.partner_id == XEN_ARGO_DOMID_ANY )
+        wildcard_pending_list_insert(src_id, ent);
+    hlist_add_head(&ent->node, &ring_info->pending);
+    ring_info->npending++;
+
+    return 0;
+}
+
+static int
+pending_requeue(struct argo_ring_info *ring_info, domid_t src_id,
+                unsigned int len)
+{
+    struct hlist_node *node;
+    struct pending_ent *ent;
+
+    ASSERT(spin_is_locked(&ring_info->lock));
+
+    hlist_for_each_entry(ent, node, &ring_info->pending, node)
+    {
+        if ( ent->domain_id == src_id )
+        {
+            /*
+             * Reuse an existing queue entry for a notification rather than add
+             * another. If the existing entry is waiting for a smaller size than
+             * the current message then adjust the record to wait for the
+             * current (larger) size to be available before triggering a
+             * notification.
+             * This assists the waiting sender by ensuring that whenever a
+             * notification is triggered, there is sufficient space available
+             * for (at least) any one of the messages awaiting transmission.
+             */
+            if ( ent->len < len )
+                ent->len = len;
+
+            return 0;
+        }
+    }
+
+    return pending_queue(ring_info, src_id, len);
 }
 
 static void
@@ -665,6 +1164,28 @@ ring_find_info(const struct domain *d, const struct argo_ring_id *id)
     argo_dprintk("no ring_info found\n");
 
     return NULL;
+}
+
+static struct argo_ring_info *
+ring_find_info_by_match(const struct domain *d, uint32_t port,
+                        domid_t partner_id)
+{
+    struct argo_ring_id id;
+    struct argo_ring_info *ring_info;
+
+    ASSERT(rw_is_locked(&d->argo->lock));
+
+    id.port = port;
+    id.domain_id = d->domain_id;
+    id.partner_id = partner_id;
+
+    ring_info = ring_find_info(d, &id);
+    if ( ring_info )
+        return ring_info;
+
+    id.partner_id = XEN_ARGO_DOMID_ANY;
+
+    return ring_find_info(d, &id);
 }
 
 static struct argo_send_info *
@@ -1005,6 +1526,95 @@ register_ring(struct domain *currd,
     return ret;
 }
 
+static long
+sendv(struct domain *src_d, const xen_argo_addr_t *src_addr,
+      const xen_argo_addr_t *dst_addr,
+      XEN_GUEST_HANDLE_PARAM(xen_argo_iov_t) iovs_hnd, unsigned long niov,
+      uint32_t message_type)
+{
+    struct domain *dst_d = NULL;
+    struct argo_ring_id src_id;
+    struct argo_ring_info *ring_info;
+    int ret = 0;
+    unsigned long len = 0;
+
+    ASSERT(src_d->domain_id == src_addr->domain_id);
+
+    argo_dprintk("sendv: (%d:%x)->(%d:%x) niov:%lu iov:%p type:%u\n",
+                 src_addr->domain_id, src_addr->port,
+                 dst_addr->domain_id, dst_addr->port,
+                 niov, iovs_hnd.p, message_type);
+
+    read_lock(&argo_lock);
+
+    if ( !src_d->argo )
+    {
+        ret = -ENODEV;
+        goto out_unlock;
+    }
+
+    src_id.port = src_addr->port;
+    src_id.domain_id = src_d->domain_id;
+    src_id.partner_id = dst_addr->domain_id;
+
+    dst_d = get_domain_by_id(dst_addr->domain_id);
+    if ( !dst_d )
+    {
+        argo_dprintk("!dst_d, ESRCH\n");
+        ret = -ESRCH;
+        goto out_unlock;
+    }
+
+    if ( !dst_d->argo )
+    {
+        argo_dprintk("!dst_d->argo, ECONNREFUSED\n");
+        ret = -ECONNREFUSED;
+        goto out_unlock;
+    }
+
+    read_lock(&dst_d->argo->lock);
+
+    ring_info = ring_find_info_by_match(dst_d, dst_addr->port,
+                                        src_addr->domain_id);
+    if ( !ring_info )
+    {
+        gprintk(XENLOG_ERR,
+                "argo: vm%u connection refused, src (vm%u:%x) dst (vm%u:%x)\n",
+                current->domain->domain_id, src_id.domain_id, src_id.port,
+                dst_addr->domain_id, dst_addr->port);
+
+        ret = -ECONNREFUSED;
+        goto out_unlock2;
+    }
+
+    spin_lock(&ring_info->lock);
+
+    ret = ringbuf_insert(dst_d, ring_info, &src_id, iovs_hnd, niov,
+                         message_type, &len);
+    if ( ret == -EAGAIN )
+    {
+        argo_dprintk("argo_ringbuf_sendv failed, EAGAIN\n");
+        /* requeue to issue a notification when space is there */
+        ret = pending_requeue(ring_info, src_addr->domain_id, len);
+    }
+
+    spin_unlock(&ring_info->lock);
+
+    if ( ret >= 0 )
+        signal_domain(dst_d);
+
+ out_unlock2:
+    read_unlock(&dst_d->argo->lock);
+
+ out_unlock:
+    if ( dst_d )
+        put_domain(dst_d);
+
+    read_unlock(&argo_lock);
+
+    return ( ret < 0 ) ? ret : len;
+}
+
 long
 do_argo_op(unsigned int cmd, XEN_GUEST_HANDLE_PARAM(void) arg1,
            XEN_GUEST_HANDLE_PARAM(void) arg2, unsigned long arg3,
@@ -1070,6 +1680,49 @@ do_argo_op(unsigned int cmd, XEN_GUEST_HANDLE_PARAM(void) arg1,
         }
 
         rc = unregister_ring(currd, unreg_hnd);
+        break;
+    }
+
+    case XEN_ARGO_OP_sendv:
+    {
+        xen_argo_send_addr_t send_addr;
+
+        XEN_GUEST_HANDLE_PARAM(xen_argo_send_addr_t) send_addr_hnd =
+            guest_handle_cast(arg1, xen_argo_send_addr_t);
+        XEN_GUEST_HANDLE_PARAM(xen_argo_iov_t) iovs_hnd =
+            guest_handle_cast(arg2, xen_argo_iov_t);
+        /* arg3 is niov */
+        /* arg4 is message_type. Must be a 32-bit value. */
+
+        rc = copy_from_guest(&send_addr, send_addr_hnd, 1) ? -EFAULT : 0;
+        if ( rc )
+            break;
+
+        if ( send_addr.src.domain_id == XEN_ARGO_DOMID_ANY )
+            send_addr.src.domain_id = currd->domain_id;
+
+        /* No domain is currently authorized to send on behalf of another */
+        if ( unlikely(send_addr.src.domain_id != currd->domain_id) )
+        {
+            rc = -EPERM;
+            break;
+        }
+
+        /* Reject niov or message_type values that are outside 32 bit range. */
+        if ( unlikely((arg3 > XEN_ARGO_MAXIOV) || (arg4 & ~0xffffffffUL)) )
+        {
+            rc = -EINVAL;
+            break;
+        }
+
+        /*
+         * Check access to the whole array here so we can use the faster __copy
+         * operations to read each element later.
+         */
+        if ( unlikely(!guest_handle_okay(iovs_hnd, arg3)) )
+            break;
+
+        rc = sendv(currd, &send_addr.src, &send_addr.dst, iovs_hnd, arg3, arg4);
         break;
     }
 
