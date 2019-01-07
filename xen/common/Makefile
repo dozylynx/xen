@@ -70,7 +70,7 @@ obj-y += xmalloc_tlsf.o
 obj-bin-$(CONFIG_X86) += $(foreach n,decompress bunzip2 unxz unlzma unlzo unlz4 earlycpio,$(n).init.o)
 
 
-obj-$(CONFIG_COMPAT) += $(addprefix compat/,domain.o kernel.o memory.o multicall.o xlat.o)
+obj-$(CONFIG_COMPAT) += $(addprefix compat/,argo.o domain.o kernel.o memory.o multicall.o xlat.o)
 
 tmem-y := tmem.o tmem_xen.o tmem_control.o
 tmem-$(CONFIG_COMPAT) += compat/tmem_xen.o
