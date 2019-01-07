@@ -154,3 +154,5 @@
 ?	argo_unregister_ring		argo.h
 ?	argo_iov			argo.h
 ?	argo_send_addr			argo.h
+?	argo_ring_data_ent		argo.h
+?	argo_ring_data			argo.h
