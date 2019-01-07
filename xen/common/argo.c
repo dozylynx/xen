@@ -1922,6 +1922,14 @@ sendv(struct domain *src_d, const xen_argo_addr_t *src_addr,
         goto out_unlock;
     }
 
+    ret = xsm_argo_send(src_d, dst_d);
+    if ( ret )
+    {
+        gprintk(XENLOG_ERR, "argo: XSM REJECTED %i -> %i\n",
+                src_addr->domain_id, dst_addr->domain_id);
+        goto out_unlock;
+    }
+
     read_lock(&dst_d->argo->lock);
 
     ring_info = ring_find_info_by_match(dst_d, dst_addr->port,
