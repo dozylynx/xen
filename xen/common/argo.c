@@ -22,18 +22,35 @@
 #include <xen/errno.h>
 #include <xen/event.h>
 #include <xen/guest_access.h>
+#include <xen/lib.h>
 #include <xen/nospec.h>
 #include <xen/sched.h>
 #include <xen/time.h>
 
 #include <public/argo.h>
 
+#define MAX_RINGS_PER_DOMAIN            128U
+
+/* All messages on the ring are padded to a multiple of the slot size. */
+#define ROUNDUP_MESSAGE(a) ROUNDUP((a), XEN_ARGO_MSG_SLOT_SIZE)
+
+/* Number of PAGEs needed to hold a ring of a given size in bytes */
+#define NPAGES_RING(ring_len) \
+    (ROUNDUP((ROUNDUP_MESSAGE(ring_len) + sizeof(xen_argo_ring_t)), PAGE_SIZE) \
+     >> PAGE_SHIFT)
+
 DEFINE_XEN_GUEST_HANDLE(xen_argo_addr_t);
+DEFINE_XEN_GUEST_HANDLE(xen_argo_gfn_t);
+DEFINE_XEN_GUEST_HANDLE(xen_argo_register_ring_t);
 DEFINE_XEN_GUEST_HANDLE(xen_argo_ring_t);
 
 /* Xen command line option to enable argo */
 static bool __read_mostly opt_argo_enabled;
 boolean_param("argo", opt_argo_enabled);
+
+/* Xen command line option for conservative or relaxed access control */
+static bool __read_mostly opt_argo_mac_permissive;
+boolean_param("argo-mac-permissive", opt_argo_mac_permissive);
 
 typedef struct argo_ring_id
 {
@@ -304,7 +321,8 @@ find_ring_info(const struct domain *d, const struct argo_ring_id *id)
             return ring_info;
         }
     }
-    argo_dprintk("no ring_info found\n");
+    argo_dprintk("no ring_info found for ring(%u:%x %u)\n",
+                 id->domain_id, id->aport, id->partner_id);
 
     return NULL;
 }
@@ -330,6 +348,66 @@ ring_unmap(const struct domain *d, struct argo_ring_info *ring_info)
         unmap_domain_page_global(ring_info->mfn_mapping[i]);
         ring_info->mfn_mapping[i] = NULL;
     }
+}
+
+static int
+ring_map_page(const struct domain *d, struct argo_ring_info *ring_info,
+              unsigned int i, void **out_ptr)
+{
+    ASSERT(LOCKING_L3(d, ring_info));
+
+    if ( i >= ring_info->nmfns )
+    {
+        gprintk(XENLOG_ERR,
+               "argo: ring (vm%u:%x vm%u) %p attempted to map page %u of %u\n",
+                ring_info->id.domain_id, ring_info->id.aport,
+                ring_info->id.partner_id, ring_info, i, ring_info->nmfns);
+        return -ENOMEM;
+    }
+    i = array_index_nospec(i, ring_info->nmfns);
+
+    if ( !ring_info->mfns || !ring_info->mfn_mapping)
+    {
+        ASSERT_UNREACHABLE();
+        ring_info->len = 0;
+        return -ENOMEM;
+    }
+
+    if ( !ring_info->mfn_mapping[i] )
+    {
+        ring_info->mfn_mapping[i] = map_domain_page_global(ring_info->mfns[i]);
+        if ( !ring_info->mfn_mapping[i] )
+        {
+            gprintk(XENLOG_ERR, "argo: ring (vm%u:%x vm%u) %p attempted to map "
+                    "page %u of %u\n",
+                    ring_info->id.domain_id, ring_info->id.aport,
+                    ring_info->id.partner_id, ring_info, i, ring_info->nmfns);
+            return -ENOMEM;
+        }
+        argo_dprintk("mapping page %"PRI_mfn" to %p\n",
+                     mfn_x(ring_info->mfns[i]), ring_info->mfn_mapping[i]);
+    }
+
+    if ( out_ptr )
+        *out_ptr = ring_info->mfn_mapping[i];
+
+    return 0;
+}
+
+static void
+update_tx_ptr(const struct domain *d, struct argo_ring_info *ring_info,
+              uint32_t tx_ptr)
+{
+    xen_argo_ring_t *ringp;
+
+    ASSERT(LOCKING_L3(d, ring_info));
+    ASSERT(ring_info->mfn_mapping[0]);
+
+    ring_info->tx_ptr = tx_ptr;
+    ringp = ring_info->mfn_mapping[0];
+
+    write_atomic(&ringp->tx_ptr, tx_ptr);
+    smp_wmb();
 }
 
 static void
@@ -492,11 +570,374 @@ partner_rings_remove(struct domain *src_d)
     }
 }
 
+/*
+ * FIXME for 4.12: investigate using check_get_page_from_gfn()
+ *                 and rewrite this function using it or with adopted logic
+ */
+static int
+find_ring_mfn(struct domain *d, gfn_t gfn, mfn_t *mfn)
+{
+    p2m_type_t p2mt;
+    int ret = 0;
+
+#ifdef CONFIG_X86
+    *mfn = get_gfn_unshare(d, gfn_x(gfn), &p2mt);
+#else
+    *mfn = p2m_lookup(d, gfn, &p2mt);
+#endif
+
+    if ( !mfn_valid(*mfn) )
+        ret = -EINVAL;
+#ifdef CONFIG_X86
+    else if ( p2m_is_paging(p2mt) || (p2mt == p2m_ram_logdirty) )
+        ret = -EAGAIN;
+#endif
+    else if ( (p2mt != p2m_ram_rw) ||
+              !get_page_and_type(mfn_to_page(*mfn), d, PGT_writable_page) )
+        ret = -EINVAL;
+
+#ifdef CONFIG_X86
+    put_gfn(d, gfn_x(gfn));
+#endif
+
+    return ret;
+}
+
+static int
+find_ring_mfns(struct domain *d, struct argo_ring_info *ring_info,
+               const unsigned int npage,
+               XEN_GUEST_HANDLE_PARAM(xen_argo_gfn_t) gfn_hnd,
+               const unsigned int len)
+{
+    unsigned int i;
+    int ret = 0;
+    mfn_t *mfns;
+    void **mfn_mapping;
+
+    ASSERT(LOCKING_Write_rings_L2(d));
+
+    if ( ring_info->mfns )
+    {
+        /* Ring already existed: drop the previous mapping. */
+        gprintk(XENLOG_INFO, "argo: vm%u re-register existing ring "
+                "(vm%u:%x vm%u) clears mapping\n",
+                d->domain_id, ring_info->id.domain_id,
+                ring_info->id.aport, ring_info->id.partner_id);
+
+        ring_remove_mfns(d, ring_info);
+        ASSERT(!ring_info->mfns);
+    }
+
+    mfns = xmalloc_array(mfn_t, npage);
+    if ( !mfns )
+        return -ENOMEM;
+
+    for ( i = 0; i < npage; i++ )
+        mfns[i] = INVALID_MFN;
+
+    mfn_mapping = xzalloc_array(void *, npage);
+    if ( !mfn_mapping )
+    {
+        xfree(mfns);
+        return -ENOMEM;
+    }
+
+    ring_info->mfns = mfns;
+    ring_info->mfn_mapping = mfn_mapping;
+
+    for ( i = 0; i < npage; i++ )
+    {
+        xen_argo_gfn_t argo_gfn;
+        mfn_t mfn;
+
+        ret = __copy_from_guest_offset(&argo_gfn, gfn_hnd, i, 1) ? -EFAULT : 0;
+        if ( ret )
+            break;
+
+        ret = find_ring_mfn(d, _gfn(argo_gfn), &mfn);
+        if ( ret )
+        {
+            gprintk(XENLOG_ERR, "argo: vm%u: invalid gfn %"PRI_gfn" "
+                    "r:(vm%u:%x vm%u) %p %u/%u\n",
+                    d->domain_id, gfn_x(_gfn(argo_gfn)),
+                    ring_info->id.domain_id, ring_info->id.aport,
+                    ring_info->id.partner_id, ring_info, i, npage);
+            break;
+        }
+
+        ring_info->mfns[i] = mfn;
+
+        argo_dprintk("%u: %"PRI_gfn" -> %"PRI_mfn"\n",
+                     i, gfn_x(_gfn(argo_gfn)), mfn_x(ring_info->mfns[i]));
+    }
+
+    ring_info->nmfns = i;
+
+    if ( ret )
+        ring_remove_mfns(d, ring_info);
+    else
+    {
+        ASSERT(ring_info->nmfns == NPAGES_RING(len));
+
+        gprintk(XENLOG_DEBUG, "argo: vm%u ring (vm%u:%x vm%u) %p "
+                "mfn_mapping %p len %u nmfns %u\n",
+                d->domain_id, ring_info->id.domain_id,
+                ring_info->id.aport, ring_info->id.partner_id, ring_info,
+                ring_info->mfn_mapping, ring_info->len, ring_info->nmfns);
+    }
+
+    return ret;
+}
+
+/*
+ * FIXME for 4.12:
+ * * shrink critical sections: move acquire/release of the global lock.
+ * * simplify the out label path when lock release has been moved.
+ */
+static long
+register_ring(struct domain *currd,
+              XEN_GUEST_HANDLE_PARAM(xen_argo_register_ring_t) reg_hnd,
+              XEN_GUEST_HANDLE_PARAM(xen_argo_gfn_t) gfn_hnd,
+              unsigned int npage, bool fail_exist)
+{
+    xen_argo_register_ring_t reg;
+    struct argo_ring_id ring_id;
+    void *map_ringp;
+    xen_argo_ring_t *ringp;
+    struct argo_ring_info *ring_info;
+    struct argo_send_info *send_info = NULL;
+    struct domain *dst_d = NULL;
+    int ret = 0;
+    unsigned int private_tx_ptr;
+
+    ASSERT(currd == current->domain);
+
+    if ( copy_from_guest(&reg, reg_hnd, 1) )
+        return -EFAULT;
+
+    /*
+     * A ring must be large enough to transmit messages, so requires space for:
+     * * 1 message header, plus
+     * * 1 payload slot (payload is always rounded to a multiple of 16 bytes)
+     *   for the message payload to be written into, plus
+     * * 1 more slot, so that the ring cannot be filled to capacity with a
+     *   single minimum-size message -- see the logic in ringbuf_insert --
+     *   allowing for this ensures that there can be space remaining when a
+     *   message is present.
+     * The above determines the minimum acceptable ring size.
+     */
+    if ( (reg.len < (sizeof(struct xen_argo_ring_message_header)
+                      + ROUNDUP_MESSAGE(1) + ROUNDUP_MESSAGE(1))) ||
+         (reg.len > XEN_ARGO_MAX_RING_SIZE) ||
+         (reg.len != ROUNDUP_MESSAGE(reg.len)) ||
+         (NPAGES_RING(reg.len) != npage) ||
+         (reg.pad != 0) )
+        return -EINVAL;
+
+    ring_id.partner_id = reg.partner_id;
+    ring_id.aport = reg.aport;
+    ring_id.domain_id = currd->domain_id;
+
+    read_lock(&L1_global_argo_rwlock);
+
+    if ( !currd->argo )
+    {
+        ret = -ENODEV;
+        goto out_unlock;
+    }
+
+    if ( reg.partner_id == XEN_ARGO_DOMID_ANY )
+    {
+        if ( !opt_argo_mac_permissive )
+        {
+            ret = -EPERM;
+            goto out_unlock;
+        }
+    }
+    else
+    {
+        dst_d = get_domain_by_id(reg.partner_id);
+        if ( !dst_d )
+        {
+            argo_dprintk("!dst_d, ESRCH\n");
+            ret = -ESRCH;
+            goto out_unlock;
+        }
+
+        if ( !dst_d->argo )
+        {
+            argo_dprintk("!dst_d->argo, ECONNREFUSED\n");
+            ret = -ECONNREFUSED;
+            put_domain(dst_d);
+            goto out_unlock;
+        }
+
+        send_info = xzalloc(struct argo_send_info);
+        if ( !send_info )
+        {
+            ret = -ENOMEM;
+            put_domain(dst_d);
+            goto out_unlock;
+        }
+        send_info->id = ring_id;
+    }
+
+    write_lock(&currd->argo->rings_L2_rwlock);
+
+    if ( currd->argo->ring_count >= MAX_RINGS_PER_DOMAIN )
+    {
+        ret = -ENOSPC;
+        goto out_unlock2;
+    }
+
+    ring_info = find_ring_info(currd, &ring_id);
+    if ( !ring_info )
+    {
+        ring_info = xzalloc(struct argo_ring_info);
+        if ( !ring_info )
+        {
+            ret = -ENOMEM;
+            goto out_unlock2;
+        }
+
+        spin_lock_init(&ring_info->L3_lock);
+
+        ring_info->id = ring_id;
+        INIT_HLIST_HEAD(&ring_info->pending);
+
+        hlist_add_head(&ring_info->node,
+                       &currd->argo->ring_hash[hash_index(&ring_info->id)]);
+
+        gprintk(XENLOG_DEBUG, "argo: vm%u registering ring (vm%u:%x vm%u)\n",
+                currd->domain_id, ring_id.domain_id, ring_id.aport,
+                ring_id.partner_id);
+    }
+    else if ( ring_info->len )
+    {
+        /*
+         * If the caller specified that the ring must not already exist,
+         * fail at attempt to add a completed ring which already exists.
+         */
+        if ( fail_exist )
+        {
+            argo_dprintk("disallowed reregistration of existing ring\n");
+            ret = -EEXIST;
+            goto out_unlock2;
+        }
+
+        if ( ring_info->len != reg.len )
+        {
+            /*
+             * Change of ring size could result in entries on the pending
+             * notifications list that will never trigger.
+             * Simple blunt solution: disallow ring resize for now.
+             * TODO: investigate enabling ring resize.
+             */
+            gprintk(XENLOG_ERR, "argo: vm%u attempted to change ring size "
+                    "(vm%u:%x vm%u)\n",
+                    currd->domain_id, ring_id.domain_id, ring_id.aport,
+                    ring_id.partner_id);
+            /*
+             * Could return EINVAL here, but if the ring didn't already
+             * exist then the arguments would have been valid, so: EEXIST.
+             */
+            ret = -EEXIST;
+            goto out_unlock2;
+        }
+
+        gprintk(XENLOG_DEBUG,
+                "argo: vm%u re-registering existing ring (vm%u:%x vm%u)\n",
+                currd->domain_id, ring_id.domain_id, ring_id.aport,
+                ring_id.partner_id);
+    }
+
+    ret = find_ring_mfns(currd, ring_info, npage, gfn_hnd, reg.len);
+    if ( ret )
+    {
+        gprintk(XENLOG_ERR,
+                "argo: vm%u failed to find ring mfns (vm%u:%x vm%u)\n",
+                currd->domain_id, ring_id.domain_id, ring_id.aport,
+                ring_id.partner_id);
+
+        ring_remove_info(currd, ring_info);
+        goto out_unlock2;
+    }
+
+    /*
+     * The first page of the memory supplied for the ring has the xen_argo_ring
+     * structure at its head, which is where the ring indexes reside.
+     */
+    ret = ring_map_page(currd, ring_info, 0, &map_ringp);
+    if ( ret )
+    {
+        gprintk(XENLOG_ERR,
+                "argo: vm%u failed to map ring mfn 0 (vm%u:%x vm%u)\n",
+                currd->domain_id, ring_id.domain_id, ring_id.aport,
+                ring_id.partner_id);
+
+        ring_remove_info(currd, ring_info);
+        goto out_unlock2;
+    }
+    ringp = map_ringp;
+
+    private_tx_ptr = read_atomic(&ringp->tx_ptr);
+
+    if ( (private_tx_ptr >= reg.len) ||
+         (ROUNDUP_MESSAGE(private_tx_ptr) != private_tx_ptr) )
+    {
+        /*
+         * Since the ring is a mess, attempt to flush the contents of it
+         * here by setting the tx_ptr to the next aligned message slot past
+         * the latest rx_ptr we have observed. Handle ring wrap correctly.
+         */
+        private_tx_ptr = ROUNDUP_MESSAGE(read_atomic(&ringp->rx_ptr));
+
+        if ( private_tx_ptr >= reg.len )
+            private_tx_ptr = 0;
+
+        update_tx_ptr(currd, ring_info, private_tx_ptr);
+    }
+
+    ring_info->tx_ptr = private_tx_ptr;
+    ring_info->len = reg.len;
+    currd->argo->ring_count++;
+
+    if ( send_info )
+    {
+        spin_lock(&dst_d->argo->send_L2_lock);
+
+        hlist_add_head(&send_info->node,
+                       &dst_d->argo->send_hash[hash_index(&send_info->id)]);
+
+        spin_unlock(&dst_d->argo->send_L2_lock);
+    }
+
+ out_unlock2:
+    if ( !ret )
+        xfree(send_info);
+
+    if ( dst_d )
+        put_domain(dst_d);
+
+    /*
+     * FIXME for 4.12: pull this write_unlock up above the cleanup actions above
+     * and add another label to aborb the two separate put_domain() calls on
+     * the error paths.
+     */
+    write_unlock(&currd->argo->rings_L2_rwlock);
+
+ out_unlock:
+    read_unlock(&L1_global_argo_rwlock);
+
+    return ret;
+}
+
 long
 do_argo_op(unsigned int cmd, XEN_GUEST_HANDLE_PARAM(void) arg1,
            XEN_GUEST_HANDLE_PARAM(void) arg2, unsigned long arg3,
            unsigned long arg4)
 {
+    struct domain *currd = current->domain;
     long rc = -EFAULT;
 
     argo_dprintk("->do_argo_op(%u,%p,%p,%lu,0x%lx)\n", cmd,
@@ -507,6 +948,38 @@ do_argo_op(unsigned int cmd, XEN_GUEST_HANDLE_PARAM(void) arg1,
 
     switch (cmd)
     {
+    case XEN_ARGO_OP_register_ring:
+    {
+        XEN_GUEST_HANDLE_PARAM(xen_argo_register_ring_t) reg_hnd =
+            guest_handle_cast(arg1, xen_argo_register_ring_t);
+        XEN_GUEST_HANDLE_PARAM(xen_argo_gfn_t) gfn_hnd =
+            guest_handle_cast(arg2, xen_argo_gfn_t);
+        /* arg3 is npage */
+        /* arg4 is flags */
+        bool fail_exist = arg4 & XEN_ARGO_REGISTER_FLAG_FAIL_EXIST;
+
+        if ( unlikely(arg3 > (XEN_ARGO_MAX_RING_SIZE >> PAGE_SHIFT)) )
+        {
+            rc = -EINVAL;
+            break;
+        }
+        /*
+         * Check access to the whole array here so we can use the faster __copy
+         * operations to read each element later.
+         */
+        if ( unlikely(!guest_handle_okay(gfn_hnd, arg3)) )
+            break;
+        /* arg4: reserve currently-undefined bits, require zero.  */
+        if ( unlikely(arg4 & ~XEN_ARGO_REGISTER_FLAG_MASK) )
+        {
+            rc = -EINVAL;
+            break;
+        }
+
+        rc = register_ring(currd, reg_hnd, gfn_hnd, arg3, fail_exist);
+        break;
+    }
+
     default:
         rc = -EOPNOTSUPP;
         break;

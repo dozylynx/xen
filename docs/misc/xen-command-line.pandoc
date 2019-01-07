@@ -195,6 +195,23 @@ This allows domains access to the Argo hypercall, which supports registration
 of memory rings with the hypervisor to receive messages, sending messages to
 other domains by hypercall and querying the ring status of other domains.
 
+### argo-mac-permissive
+> `= <boolean>`
+
+> Default: `false`
+
+Constrain the access control applied to the Argo communication mechanism.
+
+Only available if Xen is compiled with `CONFIG_ARGO` enabled.
+
+When `false`, domains may not register rings that have wildcard specified
+for the sender which would allow messages to be sent to the ring by any domain.
+This is to protect rings and the services that utilize them against DoS by a
+malicious or buggy domain spamming the ring.
+
+When the boot option is set to `true`, this constraint is relaxed and
+wildcard any-sender rings are allowed to be registered.
+
 ### asid (x86)
 > `= <boolean>`
 
