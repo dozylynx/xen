@@ -20,4 +20,5 @@
 #include <compat/argo.h>
 
 CHECK_argo_addr;
+CHECK_argo_register_ring;
 CHECK_argo_ring;
