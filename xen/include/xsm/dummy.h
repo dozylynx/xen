@@ -720,6 +720,21 @@ static XSM_INLINE int xsm_dm_op(XSM_DEFAULT_ARG struct domain *d)
 
 #endif /* CONFIG_X86 */
 
+#ifdef CONFIG_ARGO
+static XSM_INLINE int xsm_argo_register_single_source(struct domain *d,
+                                                      struct domain *t)
+{
+    return 0;
+}
+
+static XSM_INLINE int xsm_argo_register_any_source(struct domain *d,
+                                                   bool strict)
+{
+    return strict ? -EPERM : 0;
+}
+
+#endif /* CONFIG_ARGO */
+
 #include <public/version.h>
 static XSM_INLINE int xsm_xen_version (XSM_DEFAULT_ARG uint32_t op)
 {

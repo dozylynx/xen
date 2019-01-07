@@ -26,6 +26,7 @@
 #include <xen/lib.h>
 #include <xen/nospec.h>
 #include <xen/time.h>
+#include <xsm/xsm.h>
 #include <public/argo.h>
 
 #define MAX_RINGS_PER_DOMAIN            128U
@@ -1582,11 +1583,9 @@ register_ring(struct domain *currd,
 
     if ( reg.partner_id == XEN_ARGO_DOMID_ANY )
     {
-        if ( opt_argo_mac_enforcing )
-        {
-            ret = -EPERM;
+        ret = xsm_argo_register_any_source(currd, opt_argo_mac_enforcing);
+        if ( ret )
             goto out_unlock;
-        }
     }
     else
     {
@@ -1595,6 +1594,13 @@ register_ring(struct domain *currd,
         {
             argo_dprintk("!dst_d, ESRCH\n");
             ret = -ESRCH;
+            goto out_unlock;
+        }
+
+        ret = xsm_argo_register_single_source(currd, dst_d);
+        if ( ret )
+        {
+            put_domain(dst_d);
             goto out_unlock;
         }
 
