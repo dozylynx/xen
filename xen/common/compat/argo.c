@@ -41,4 +41,22 @@ static inline int __maybe_unused name(k xen_ ## n *x, k compat_ ## n *c) \
 }
 
 CHECK_argo_send_addr;
+CHECK_argo_ring_data_ent;
 CHECK_argo_iov;
+
+/*
+ * Disable sizeof type checking for the following struct checks because
+ * these structs have fields of types that differ in the compat vs non-compat
+ * structs with variable size which prevents the size check validation.
+ */
+
+#undef CHECK_FIELD_COMMON_
+#define CHECK_FIELD_COMMON_(k, name, n, f) \
+static inline int __maybe_unused name(k xen_ ## n *x, k compat_ ## n *c) \
+{ \
+    BUILD_BUG_ON(offsetof(k xen_ ## n, f) != \
+                 offsetof(k compat_ ## n, f)); \
+    return 1; \
+}
+
+CHECK_argo_ring_data;
