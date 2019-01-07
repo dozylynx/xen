@@ -32,6 +32,7 @@
 #include <xen/grant_table.h>
 #include <xen/xenoprof.h>
 #include <xen/irq.h>
+#include <xen/argo.h>
 #include <asm/debugger.h>
 #include <asm/p2m.h>
 #include <asm/processor.h>
@@ -277,6 +278,10 @@ static void _domain_destroy(struct domain *d)
 
     xfree(d->pbuf);
 
+#ifdef CONFIG_ARGO
+    argo_destroy(d);
+#endif
+
     rangeset_domain_destroy(d);
 
     free_cpumask_var(d->dirty_cpumask);
@@ -376,6 +381,9 @@ struct domain *domain_create(domid_t domid,
     spin_lock_init(&d->hypercall_deadlock_mutex);
     INIT_PAGE_LIST_HEAD(&d->page_list);
     INIT_PAGE_LIST_HEAD(&d->xenpage_list);
+#ifdef CONFIG_ARGO
+    rwlock_init(&d->argo_lock);
+#endif
 
     spin_lock_init(&d->node_affinity_lock);
     d->node_affinity = NODE_MASK_ALL;
@@ -444,6 +452,11 @@ struct domain *domain_create(domid_t domid,
                                      config->max_maptrack_frames)) != 0 )
             goto fail;
         init_status |= INIT_gnttab;
+
+#ifdef CONFIG_ARGO
+        if ( (err = argo_init(d)) != 0 )
+            goto fail;
+#endif
 
         err = -ENOMEM;
 
@@ -717,6 +730,9 @@ int domain_kill(struct domain *d)
         if ( d->is_dying != DOMDYING_alive )
             return domain_kill(d);
         d->is_dying = DOMDYING_dying;
+#ifdef CONFIG_ARGO
+        argo_destroy(d);
+#endif
         evtchn_destroy(d);
         gnttab_release_mappings(d);
         tmem_destroy(d->tmem_client);
@@ -1174,6 +1190,10 @@ int domain_soft_reset(struct domain *d)
         return rc;
 
     grant_table_warn_active_grants(d);
+
+#ifdef CONFIG_ARGO
+    argo_soft_reset(d);
+#endif
 
     for_each_vcpu ( d, v )
     {
