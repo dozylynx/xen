@@ -148,3 +148,5 @@
 ?	flask_setenforce		xsm/flask_op.h
 !	flask_sid_context		xsm/flask_op.h
 ?	flask_transition		xsm/flask_op.h
+?	argo_addr			argo.h
+?	argo_ring			argo.h
