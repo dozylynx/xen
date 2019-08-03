@@ -134,15 +134,6 @@ struct argo_ring_info
     unsigned int npending;
 };
 
-/* Data about a single-sender ring, held by the sender (partner) domain */
-struct argo_send_info
-{
-    /* next node in the hash, protected by send_L2 */
-    struct list_head node;
-    /* this ring's id, protected by send_L2 */
-    struct argo_ring_id id;
-};
-
 /* A space-available notification that is awaiting sufficient space */
 struct pending_ent
 {
@@ -183,15 +174,6 @@ struct argo_domain
     struct list_head ring_hash[ARGO_HASHTABLE_SIZE];
     /* Counter of rings registered by this domain. Protected by rings_L3. */
     unsigned int ring_count;
-
-    /* send_L2 */
-    spinlock_t send_L2_lock;
-    /*
-     * Hash table of argo_send_info about rings other domains have registered
-     * for this domain to send to. Single partner, non-wildcard rings.
-     * Protected by send_L2.
-     */
-    struct list_head send_hash[ARGO_HASHTABLE_SIZE];
 
     /* wildcard_L2 */
     spinlock_t wildcard_L2_lock;
@@ -243,17 +225,6 @@ static DEFINE_RWLOCK(L1_global_argo_rwlock); /* L1 */
  * rings_L3 already protects: node, id, lock.
  *
  * To acquire L4 you must already have R(rings_L3). W(rings_L3) implies L4.
- *
- * == send_L2 : The per-domain single-sender partner rings lock:
- *              d->argo->send_L2_lock
- *
- * Protects the per-domain send hash table : d->argo->send_hash
- * and the elements in the hash table, and the node and id fields
- * in struct argo_send_info in the hash table.
- *
- * To take send_L2, you must already have R(L1). W(L1) implies send_L2.
- * Do not attempt to acquire a rings_L3 on any domain after taking and while
- * holding a send_L2 lock -- acquire the rings_L3 (if one is needed) beforehand.
  *
  * == wildcard_L2 : The per-domain wildcard pending list lock:
  *                  d->argo->wildcard_L2_lock
@@ -309,10 +280,6 @@ static DEFINE_RWLOCK(L1_global_argo_rwlock); /* L1 */
     ((LOCKING_Read_L1 && rw_is_locked(&(d)->argo->rings_L3_rwlock) \
       && spin_is_locked(&(r)->L4_lock)) || LOCKING_Write_rings_L3(d))
 
-#define LOCKING_send_L2(d) \
-    ((LOCKING_Read_L1 && spin_is_locked(&(d)->argo->send_L2_lock)) || \
-     LOCKING_Write_L1)
-
 /* Change this to #define ARGO_DEBUG here to enable more debug messages */
 #undef ARGO_DEBUG
 
@@ -324,8 +291,8 @@ static DEFINE_RWLOCK(L1_global_argo_rwlock); /* L1 */
 
 /*
  * This hash function is used to distribute rings within the per-domain
- * hash tables (d->argo->ring_hash and d->argo_send_hash). The hash table
- * will provide a struct if a match is found with a 'argo_ring_id' key:
+ * hash table (d->argo->ring_hash). The hash table will provide a struct
+ * if a match is found with a 'argo_ring_id' key:
  * ie. the key is a (domain id, argo port, partner domain id) tuple.
  * The algorithm approximates the string hashing function 'djb2'.
  */
@@ -401,36 +368,6 @@ find_ring_info_by_match(const struct domain *d, xen_argo_port_t aport,
     id.partner_id = XEN_ARGO_DOMID_ANY;
 
     return find_ring_info(d, &id);
-}
-
-static struct argo_send_info *
-find_send_info(const struct domain *d, const struct argo_ring_id *id)
-{
-    struct argo_send_info *send_info;
-    const struct list_head *bucket;
-
-    ASSERT(LOCKING_send_L2(d));
-
-    /* List is not modified here. Search and return the match if found. */
-    bucket = &d->argo->send_hash[hash_index(id)];
-
-    list_for_each_entry(send_info, bucket, node)
-    {
-        const struct argo_ring_id *cmpid = &send_info->id;
-
-        if ( cmpid->aport == id->aport &&
-             cmpid->domain_id == id->domain_id &&
-             cmpid->partner_id == id->partner_id )
-        {
-            argo_dprintk("found send_info for ring(%u:%x %u)\n",
-                         id->domain_id, id->aport, id->partner_id);
-            return send_info;
-        }
-    }
-    argo_dprintk("no send_info for ring(%u:%x %u)\n",
-                 id->domain_id, id->aport, id->partner_id);
-
-    return NULL;
 }
 
 static void
@@ -1260,55 +1197,6 @@ domain_rings_remove_all(struct domain *d)
     d->argo->ring_count = 0;
 }
 
-/*
- * Tear down all rings of other domains where src_d domain is the partner.
- * (ie. it is the single domain that can send to those rings.)
- * This will also cancel any pending notifications about those rings.
- */
-static void
-partner_rings_remove(struct domain *src_d)
-{
-    unsigned int i;
-
-    ASSERT(LOCKING_Write_L1);
-
-    for ( i = 0; i < ARGO_HASHTABLE_SIZE; ++i )
-    {
-        struct argo_send_info *send_info;
-        struct list_head *bucket = &src_d->argo->send_hash[i];
-
-        /* Remove all ents from the send list. Take each off their ring list. */
-        while ( (send_info = list_first_entry_or_null(bucket,
-                                                      struct argo_send_info,
-                                                      node)) )
-        {
-            struct domain *dst_d = get_domain_by_id(send_info->id.domain_id);
-
-            if ( dst_d && dst_d->argo )
-            {
-                struct argo_ring_info *ring_info =
-                    find_ring_info(dst_d, &send_info->id);
-
-                if ( ring_info )
-                {
-                    ring_remove_info(dst_d, ring_info);
-                    dst_d->argo->ring_count--;
-                }
-                else
-                    ASSERT_UNREACHABLE();
-            }
-            else
-                ASSERT_UNREACHABLE();
-
-            if ( dst_d )
-                put_domain(dst_d);
-
-            list_del(&send_info->node);
-            xfree(send_info);
-        }
-    }
-}
-
 static int
 fill_ring_data(const struct domain *currd,
                XEN_GUEST_HANDLE(xen_argo_ring_data_ent_t) data_ent_hnd)
@@ -1533,8 +1421,6 @@ unregister_ring(struct domain *currd,
     xen_argo_unregister_ring_t unreg;
     struct argo_ring_id ring_id;
     struct argo_ring_info *ring_info = NULL;
-    struct argo_send_info *send_info = NULL;
-    struct domain *dst_d = NULL;
 
     ASSERT(currd == current->domain);
 
@@ -1565,35 +1451,10 @@ unregister_ring(struct domain *currd,
     ring_remove_info(currd, ring_info);
     currd->argo->ring_count--;
 
-    if ( ring_id.partner_id == XEN_ARGO_DOMID_ANY )
-        goto out;
-
-    dst_d = get_domain_by_id(ring_id.partner_id);
-    if ( !dst_d || !dst_d->argo )
-    {
-        ASSERT_UNREACHABLE();
-        goto out;
-    }
-
-    spin_lock(&dst_d->argo->send_L2_lock);
-
-    send_info = find_send_info(dst_d, &ring_id);
-    if ( send_info )
-        list_del(&send_info->node);
-    else
-        ASSERT_UNREACHABLE();
-
-    spin_unlock(&dst_d->argo->send_L2_lock);
-
  out:
     write_unlock(&currd->argo->rings_L3_rwlock);
 
     read_unlock(&L1_global_argo_rwlock);
-
-    if ( dst_d )
-        put_domain(dst_d);
-
-    xfree(send_info);
 
     if ( !ring_info )
     {
@@ -1616,7 +1477,6 @@ register_ring(struct domain *currd,
     void *map_ringp;
     xen_argo_ring_t *ringp;
     struct argo_ring_info *ring_info, *new_ring_info = NULL;
-    struct argo_send_info *send_info = NULL;
     struct domain *dst_d = NULL;
     int ret = 0;
     unsigned int private_tx_ptr;
@@ -1672,14 +1532,6 @@ register_ring(struct domain *currd,
         ret = xsm_argo_register_single_source(currd, dst_d);
         if ( ret )
             goto out;
-
-        send_info = xzalloc(struct argo_send_info);
-        if ( !send_info )
-        {
-            ret = -ENOMEM;
-            goto out;
-        }
-        send_info->id = ring_id;
     }
 
     /*
@@ -1826,16 +1678,6 @@ register_ring(struct domain *currd,
     ring_info->len = reg.len;
     currd->argo->ring_count++;
 
-    if ( send_info )
-    {
-        spin_lock(&dst_d->argo->send_L2_lock);
-
-        list_add(&send_info->node,
-                 &dst_d->argo->send_hash[hash_index(&send_info->id)]);
-
-        spin_unlock(&dst_d->argo->send_L2_lock);
-    }
-
  out_unlock2:
     write_unlock(&currd->argo->rings_L3_rwlock);
 
@@ -1845,9 +1687,6 @@ register_ring(struct domain *currd,
  out:
     if ( dst_d )
         put_domain(dst_d);
-
-    if ( ret )
-        xfree(send_info);
 
     xfree(new_ring_info);
 
@@ -2282,14 +2121,11 @@ argo_domain_init(struct argo_domain *argo)
     unsigned int i;
 
     rwlock_init(&argo->rings_L3_rwlock);
-    spin_lock_init(&argo->send_L2_lock);
     spin_lock_init(&argo->wildcard_L2_lock);
 
     for ( i = 0; i < ARGO_HASHTABLE_SIZE; ++i )
-    {
         INIT_LIST_HEAD(&argo->ring_hash[i]);
-        INIT_LIST_HEAD(&argo->send_hash[i]);
-    }
+
     INIT_LIST_HEAD(&argo->wildcard_pend_list);
 }
 
@@ -2333,7 +2169,6 @@ argo_destroy(struct domain *d)
     if ( d->argo )
     {
         domain_rings_remove_all(d);
-        partner_rings_remove(d);
         wildcard_rings_pending_remove(d);
         XFREE(d->argo);
     }
@@ -2351,7 +2186,6 @@ argo_soft_reset(struct domain *d)
     if ( d->argo )
     {
         domain_rings_remove_all(d);
-        partner_rings_remove(d);
         wildcard_rings_pending_remove(d);
 
         /*
