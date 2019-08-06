@@ -172,7 +172,10 @@ struct argo_domain
      * Protected by rings_L3.
      */
     struct list_head ring_hash[ARGO_HASHTABLE_SIZE];
-    /* Counter of rings registered by this domain. Protected by rings_L3. */
+
+    /* count_L2 */
+    spinlock_t count_L2_lock;
+    /* Counter of rings registered by this domain. Protected by count_L2. */
     unsigned int ring_count;
 
     /* wildcard_L2 */
@@ -225,6 +228,13 @@ static DEFINE_RWLOCK(L1_global_argo_rwlock); /* L1 */
  * rings_L3 already protects: node, id, lock.
  *
  * To acquire L4 you must already have R(rings_L3). W(rings_L3) implies L4.
+ *
+ * == count_L2 : The per-domain ring counter lock: d->argo->count_L2_lock;
+ *
+ * Protects d->argo->ring_count.
+ *
+ * To take count_L2, must hold R(L1) first. W(L1) implies count_L2.
+ * count_L2 is only ever acquired by a domain acting on itself (ie. currd).
  *
  * == wildcard_L2 : The per-domain wildcard pending list lock:
  *                  d->argo->wildcard_L2_lock
@@ -1182,7 +1192,7 @@ domain_rings_remove_all(struct domain *d)
 {
     unsigned int i;
 
-    ASSERT(LOCKING_Write_rings_L3(d));
+    ASSERT(LOCKING_Write_L1);
 
     for ( i = 0; i < ARGO_HASHTABLE_SIZE; ++i )
     {
@@ -1449,7 +1459,10 @@ unregister_ring(struct domain *currd,
         goto out;
 
     ring_remove_info(currd, ring_info);
+
+    spin_lock(&currd->argo->count_L2_lock);
     currd->argo->ring_count--;
+    spin_unlock(&currd->argo->count_L2_lock);
 
  out:
     write_unlock(&currd->argo->rings_L3_rwlock);
@@ -1562,11 +1575,18 @@ register_ring(struct domain *currd,
 
     write_lock(&currd->argo->rings_L3_rwlock);
 
+    /* Minimize criticial region for count_L2: do an optimistic increment */
+    spin_lock(&currd->argo->count_L2_lock);
+
     if ( currd->argo->ring_count >= MAX_RINGS_PER_DOMAIN )
-    {
         ret = -ENOSPC;
+    else
+        currd->argo->ring_count++;
+
+    spin_unlock(&currd->argo->count_L2_lock);
+
+    if ( ret )
         goto out_unlock2;
-    }
 
     ring_info = find_ring_info(currd, &ring_id);
     if ( !ring_info )
@@ -1599,7 +1619,7 @@ register_ring(struct domain *currd,
                     currd->domain_id, ring_id.domain_id, ring_id.aport,
                     ring_id.partner_id);
             ret = -EEXIST;
-            goto out_unlock2;
+            goto out_undo;
         }
 
         if ( ring_info->len != reg.len )
@@ -1619,7 +1639,7 @@ register_ring(struct domain *currd,
              * exist then the arguments would have been valid, so: EEXIST.
              */
             ret = -EEXIST;
-            goto out_unlock2;
+            goto out_undo;
         }
 
         argo_dprintk("argo: vm%u re-registering existing ring (vm%u:%x vm%u)\n",
@@ -1636,7 +1656,7 @@ register_ring(struct domain *currd,
                 ring_id.partner_id);
 
         ring_remove_info(currd, ring_info);
-        goto out_unlock2;
+        goto out_undo;
     }
 
     /*
@@ -1652,7 +1672,7 @@ register_ring(struct domain *currd,
                 ring_id.partner_id);
 
         ring_remove_info(currd, ring_info);
-        goto out_unlock2;
+        goto out_undo;
     }
     ringp = map_ringp;
 
@@ -1676,7 +1696,15 @@ register_ring(struct domain *currd,
 
     ring_info->tx_ptr = private_tx_ptr;
     ring_info->len = reg.len;
-    currd->argo->ring_count++;
+
+    if ( ret )
+    {
+ out_undo:
+        /* Undo the optimistic ring count increment. */
+        spin_lock(&currd->argo->count_L2_lock);
+        currd->argo->ring_count--;
+        spin_unlock(&currd->argo->count_L2_lock);
+    }
 
  out_unlock2:
     write_unlock(&currd->argo->rings_L3_rwlock);
@@ -2122,6 +2150,7 @@ argo_domain_init(struct argo_domain *argo)
 
     rwlock_init(&argo->rings_L3_rwlock);
     spin_lock_init(&argo->wildcard_L2_lock);
+    spin_lock_init(&argo->count_L2_lock);
 
     for ( i = 0; i < ARGO_HASHTABLE_SIZE; ++i )
         INIT_LIST_HEAD(&argo->ring_hash[i]);
