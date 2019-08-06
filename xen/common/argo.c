@@ -359,25 +359,22 @@ find_ring_info(const struct domain *d, const struct argo_ring_id *id)
 }
 
 static struct argo_ring_info *
-find_ring_info_by_match(const struct domain *d, xen_argo_port_t aport,
-                        domid_t partner_id)
+find_ring_info_by_match(const struct domain *d, const struct argo_ring_id *id)
 {
-    struct argo_ring_id id;
+    struct argo_ring_id tmpid;
     struct argo_ring_info *ring_info;
 
     ASSERT(LOCKING_Read_rings_L3(d));
 
-    id.aport = aport;
-    id.domain_id = d->domain_id;
-    id.partner_id = partner_id;
-
-    ring_info = find_ring_info(d, &id);
+    ring_info = find_ring_info(d, id);
     if ( ring_info )
         return ring_info;
 
-    id.partner_id = XEN_ARGO_DOMID_ANY;
+    tmpid.aport = id->aport;
+    tmpid.domain_id = id->domain_id;
+    tmpid.partner_id = XEN_ARGO_DOMID_ANY;
 
-    return find_ring_info(d, &id);
+    return find_ring_info(d, &tmpid);
 }
 
 static void
@@ -1214,6 +1211,7 @@ fill_ring_data(const struct domain *currd,
     xen_argo_ring_data_ent_t ent;
     struct domain *dst_d;
     struct argo_ring_info *ring_info;
+    struct argo_ring_id id;
     int ret = 0;
 
     ASSERT(currd == current->domain);
@@ -1242,10 +1240,13 @@ fill_ring_data(const struct domain *currd,
         return ret;
     }
 
+    id.domain_id = currd->domain_id;
+    id.partner_id = dst_d->domain_id;
+    id.aport = ent.ring.aport;
+
     read_lock(&dst_d->argo->rings_L3_rwlock);
 
-    ring_info = find_ring_info_by_match(dst_d, ent.ring.aport,
-                                        currd->domain_id);
+    ring_info = find_ring_info_by_match(dst_d, &id);
     if ( ring_info )
     {
         unsigned int space_avail;
@@ -1830,7 +1831,7 @@ sendv(struct domain *src_d, xen_argo_addr_t *src_addr,
       uint32_t message_type)
 {
     struct domain *dst_d = NULL;
-    struct argo_ring_id src_id;
+    struct argo_ring_id src_id, dst_id;
     struct argo_ring_info *ring_info;
     int ret = 0;
     unsigned int len = 0;
@@ -1884,10 +1885,13 @@ sendv(struct domain *src_d, xen_argo_addr_t *src_addr,
         goto out_unlock;
     }
 
+    dst_id.domain_id = dst_d->domain_id;
+    dst_id.partner_id = src_id.domain_id;
+    dst_id.aport = dst_addr->aport;
+
     read_lock(&dst_d->argo->rings_L3_rwlock);
 
-    ring_info = find_ring_info_by_match(dst_d, dst_addr->aport,
-                                        src_id.domain_id);
+    ring_info = find_ring_info_by_match(dst_d, &dst_id);
     if ( !ring_info )
     {
         gprintk(XENLOG_ERR,
