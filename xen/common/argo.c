@@ -165,13 +165,10 @@ struct pending_ent
 #define ARGO_HASHTABLE_SIZE 32
 struct argo_domain
 {
-    /* rings_L3 */
-    rwlock_t rings_L3_rwlock;
-    /*
-     * Hash table of argo_ring_info about rings this domain has registered.
-     * Protected by rings_L3.
-     */
-    struct list_head ring_hash[ARGO_HASHTABLE_SIZE];
+    /* links_L2 */
+    rwlock_t links_L2_rwlock;
+    /* A single link. Protected by links_L2. */
+    struct argo_link *link;
 
     /* count_L2 */
     spinlock_t count_L2_lock;
@@ -185,6 +182,17 @@ struct argo_domain
      * rings registered by other domains. Protected by wildcard_L2.
      */
     struct list_head wildcard_pend_list;
+};
+
+struct argo_link
+{
+    /* rings_L3 */
+    rwlock_t rings_L3_rwlock;
+    /*
+     * Hash table of argo_ring_info about rings this domain has registered.
+     * Protected by rings_L3.
+     */
+    struct list_head ring_hash[ARGO_HASHTABLE_SIZE];
 };
 
 /*
@@ -210,17 +218,20 @@ struct argo_domain
 static DEFINE_RWLOCK(L1_global_argo_rwlock); /* L1 */
 
 /*
- * == rings_L3 : The per-domain ring hash lock: d->argo->rings_L3_rwlock
+ * == links_L2 : The per-domain link hash lock: d->argo->links_L2_rwlock
+ *
+ * Holding a read lock on links_L2 protects the link: d->argo->link
+ *
+ * == rings_L3 : The per-link ring hash lock: link->rings_L3_rwlock
  *
  * Holding a read lock on rings_L3 protects the ring hash table and
- * the elements in the hash_table d->argo->ring_hash, and
- * the node and id fields in struct argo_ring_info in the
- * hash table.
+ * the elements in the hash_table link->ring_hash, and the node and id fields
+ * in struct argo_ring_info in the hash table.
  * Holding a write lock on rings_L3 protects all of the elements of all the
  * struct argo_ring_info belonging to this domain.
  *
- * To take rings_L3 you must already have R(L1). W(L1) implies W(rings_L3) and
- * L4.
+ * To take rings_L3 you must already have R(L1) and R(links_L2).
+ * W(L1) implies W(rings_L3) and L4.
  *
  * == L4 : The individual ring_info lock: ring_info->L4_lock
  *
@@ -251,12 +262,12 @@ static DEFINE_RWLOCK(L1_global_argo_rwlock); /* L1 */
  *
  * These macros encode the logic to verify that the locking has adhered to the
  * locking discipline above.
- * eg. On entry to logic that requires holding at least R(rings_L3), this:
- *      ASSERT(LOCKING_Read_rings_L3(d));
+ * eg. On entry to logic that requires holding at least R(links_L2), this:
+ *      ASSERT(LOCKING_Read_links_L2(d));
  *
  * checks that the lock state is sufficient, validating that one of the
- * following must be true when executed:       R(rings_L3) && R(L1)
- *                                        or:  W(rings_L3) && R(L1)
+ * following must be true when executed:       R(links_L2) && R(L1)
+ *                                        or:  W(links_L2) && R(L1)
  *                                        or:  W(L1)
  *
  * The LOCKING macros defined below here are for use at verification points.
@@ -270,25 +281,34 @@ static DEFINE_RWLOCK(L1_global_argo_rwlock); /* L1 */
  */
 #define LOCKING_Read_L1 (rw_is_locked(&L1_global_argo_rwlock))
 
-#define LOCKING_Write_rings_L3(d) \
-    ((LOCKING_Read_L1 && rw_is_write_locked(&(d)->argo->rings_L3_rwlock)) || \
+#define LOCKING_Write_links_L2(d) \
+    ((LOCKING_Read_L1 && rw_is_write_locked(&(d)->argo->links_L2_rwlock)) || \
      LOCKING_Write_L1)
 /*
- * Skip checking LOCKING_Write_rings_L3(d) within this LOCKING_Read_rings_L3
+ * Skip checking LOCKING_Write_links_L2(d) within this LOCKING_Read_links_L2
  * definition because the first clause that is testing R(L1) && R(L2) will also
  * return true if R(L1) && W(L2) is true, because of the way that rw_is_locked
  * behaves. This results in a slightly shorter and faster implementation.
  */
-#define LOCKING_Read_rings_L3(d) \
-    ((LOCKING_Read_L1 && rw_is_locked(&(d)->argo->rings_L3_rwlock)) || \
+#define LOCKING_Read_links_L2(d) \
+    ((LOCKING_Read_L1 && rw_is_locked(&(d)->argo->links_L2_rwlock)) || \
      LOCKING_Write_L1)
+
+#define LOCKING_Write_rings_L3(d,lnk) \
+    ((LOCKING_Read_L1 && rw_is_locked(&(d)->argo->links_L2_rwlock) && \
+      rw_is_write_locked(&(lnk)->rings_L3_rwlock)) || LOCKING_Write_links_L2(d))
+
+#define LOCKING_Read_rings_L3(d,lnk) \
+    ((LOCKING_Read_L1 && rw_is_locked(&(d)->argo->links_L2_rwlock) && \
+      rw_is_locked(&(lnk)->rings_L3_rwlock)) || LOCKING_Write_links_L2(d))
 /*
  * Skip checking LOCKING_Write_L1 within this LOCKING_L4 definition because
  * LOCKING_Write_rings_L3(d) will return true for that condition.
  */
-#define LOCKING_L4(d, r) \
-    ((LOCKING_Read_L1 && rw_is_locked(&(d)->argo->rings_L3_rwlock) \
-      && spin_is_locked(&(r)->L4_lock)) || LOCKING_Write_rings_L3(d))
+#define LOCKING_L4(d, lnk, r) \
+    ((LOCKING_Read_L1 && rw_is_locked(&(d)->argo->links_L2_rwlock) \
+      && rw_is_locked(&(lnk)->rings_L3_rwlock) \
+      && spin_is_locked(&(r)->L4_lock)) || LOCKING_Write_rings_L3(d, lnk))
 
 /* Change this to #define ARGO_DEBUG here to enable more debug messages */
 #undef ARGO_DEBUG
@@ -300,8 +320,8 @@ static DEFINE_RWLOCK(L1_global_argo_rwlock); /* L1 */
 #endif
 
 /*
- * This hash function is used to distribute rings within the per-domain
- * hash table (d->argo->ring_hash). The hash table will provide a struct
+ * This hash function is used to distribute rings within the ring
+ * hash tables (link->ring_hash). The hash table will provide a struct
  * if a match is found with a 'argo_ring_id' key:
  * ie. the key is a (domain id, argo port, partner domain id) tuple.
  * The algorithm approximates the string hashing function 'djb2'.
@@ -329,15 +349,16 @@ hash_index(const struct argo_ring_id *id)
 }
 
 static struct argo_ring_info *
-find_ring_info(const struct domain *d, const struct argo_ring_id *id)
+find_ring_info(const struct domain *d, const struct argo_link *link,
+               const struct argo_ring_id *id)
 {
     struct argo_ring_info *ring_info;
     const struct list_head *bucket;
 
-    ASSERT(LOCKING_Read_rings_L3(d));
+    ASSERT(LOCKING_Read_rings_L3(d, link));
 
     /* List is not modified here. Search and return the match if found. */
-    bucket = &d->argo->ring_hash[hash_index(id)];
+    bucket = &link->ring_hash[hash_index(id)];
 
     list_for_each_entry(ring_info, bucket, node)
     {
@@ -359,14 +380,15 @@ find_ring_info(const struct domain *d, const struct argo_ring_id *id)
 }
 
 static struct argo_ring_info *
-find_ring_info_by_match(const struct domain *d, const struct argo_ring_id *id)
+find_ring_info_by_match(const struct domain *d, const struct argo_link *link,
+                        const struct argo_ring_id *id)
 {
     struct argo_ring_id tmpid;
     struct argo_ring_info *ring_info;
 
-    ASSERT(LOCKING_Read_rings_L3(d));
+    ASSERT(LOCKING_Read_rings_L3(d, link));
 
-    ring_info = find_ring_info(d, id);
+    ring_info = find_ring_info(d, link, id);
     if ( ring_info )
         return ring_info;
 
@@ -374,7 +396,7 @@ find_ring_info_by_match(const struct domain *d, const struct argo_ring_id *id)
     tmpid.domain_id = id->domain_id;
     tmpid.partner_id = XEN_ARGO_DOMID_ANY;
 
-    return find_ring_info(d, &tmpid);
+    return find_ring_info(d, link, &tmpid);
 }
 
 static void
@@ -398,11 +420,12 @@ signal_domid(domid_t domain_id)
 }
 
 static void
-ring_unmap(const struct domain *d, struct argo_ring_info *ring_info)
+ring_unmap(const struct domain *d, const struct argo_link *link,
+           struct argo_ring_info *ring_info)
 {
     unsigned int i;
 
-    ASSERT(LOCKING_L4(d, ring_info));
+    ASSERT(LOCKING_L4(d, link, ring_info));
 
     if ( !ring_info->mfn_mapping )
         return;
@@ -424,10 +447,10 @@ ring_unmap(const struct domain *d, struct argo_ring_info *ring_info)
 }
 
 static int
-ring_map_page(const struct domain *d, struct argo_ring_info *ring_info,
-              unsigned int i, void **out_ptr)
+ring_map_page(const struct domain *d, const struct argo_link *link,
+              struct argo_ring_info *ring_info, unsigned int i, void **out_ptr)
 {
-    ASSERT(LOCKING_L4(d, ring_info));
+    ASSERT(LOCKING_L4(d, link, ring_info));
 
     /*
      * FIXME: Investigate using vmap to create a single contiguous virtual
@@ -476,12 +499,12 @@ ring_map_page(const struct domain *d, struct argo_ring_info *ring_info,
 }
 
 static void
-update_tx_ptr(const struct domain *d, struct argo_ring_info *ring_info,
-              uint32_t tx_ptr)
+update_tx_ptr(const struct domain *d, const struct argo_link *link,
+              struct argo_ring_info *ring_info, uint32_t tx_ptr)
 {
     xen_argo_ring_t *ringp;
 
-    ASSERT(LOCKING_L4(d, ring_info));
+    ASSERT(LOCKING_L4(d, link, ring_info));
     ASSERT(ring_info->mfn_mapping[0]);
 
     ring_info->tx_ptr = tx_ptr;
@@ -492,8 +515,8 @@ update_tx_ptr(const struct domain *d, struct argo_ring_info *ring_info,
 }
 
 static int
-memcpy_to_guest_ring(const struct domain *d, struct argo_ring_info *ring_info,
-                     unsigned int offset,
+memcpy_to_guest_ring(const struct domain *d, const struct argo_link *link,
+                     struct argo_ring_info *ring_info, unsigned int offset,
                      const void *src, XEN_GUEST_HANDLE(uint8) src_hnd,
                      unsigned int len)
 {
@@ -502,7 +525,7 @@ memcpy_to_guest_ring(const struct domain *d, struct argo_ring_info *ring_info,
     int ret;
     unsigned int src_offset = 0;
 
-    ASSERT(LOCKING_L4(d, ring_info));
+    ASSERT(LOCKING_L4(d, link, ring_info));
 
     offset &= ~PAGE_MASK;
 
@@ -514,7 +537,7 @@ memcpy_to_guest_ring(const struct domain *d, struct argo_ring_info *ring_info,
         unsigned int head_len = (offset + len) > PAGE_SIZE ? PAGE_SIZE - offset
                                                            : len;
 
-        ret = ring_map_page(d, ring_info, mfns_index, &dst);
+        ret = ring_map_page(d, link, ring_info, mfns_index, &dst);
         if ( ret )
             return ret;
 
@@ -544,19 +567,19 @@ memcpy_to_guest_ring(const struct domain *d, struct argo_ring_info *ring_info,
  * See get_sanitized_ring for a safer alternative.
  */
 static int
-get_rx_ptr(const struct domain *d, struct argo_ring_info *ring_info,
-           uint32_t *rx_ptr)
+get_rx_ptr(const struct domain *d, const struct argo_link *link,
+           struct argo_ring_info *ring_info, uint32_t *rx_ptr)
 {
     void *src;
     xen_argo_ring_t *ringp;
     int ret;
 
-    ASSERT(LOCKING_L4(d, ring_info));
+    ASSERT(LOCKING_L4(d, link, ring_info));
 
     if ( !ring_info->nmfns || ring_info->nmfns < NPAGES_RING(ring_info->len) )
         return -EINVAL;
 
-    ret = ring_map_page(d, ring_info, 0, &src);
+    ret = ring_map_page(d, link, ring_info, 0, &src);
     if ( ret )
         return ret;
 
@@ -574,15 +597,15 @@ get_rx_ptr(const struct domain *d, struct argo_ring_info *ring_info,
  * space calculation.
  */
 static int
-get_sanitized_ring(const struct domain *d, xen_argo_ring_t *ring,
-                   struct argo_ring_info *ring_info)
+get_sanitized_ring(const struct domain *d, const struct argo_link *link,
+                   xen_argo_ring_t *ring, struct argo_ring_info *ring_info)
 {
     uint32_t rx_ptr;
     int ret;
 
-    ASSERT(LOCKING_L4(d, ring_info));
+    ASSERT(LOCKING_L4(d, link, ring_info));
 
-    ret = get_rx_ptr(d, ring_info, &rx_ptr);
+    ret = get_rx_ptr(d, link, ring_info, &rx_ptr);
     if ( ret )
         return ret;
 
@@ -598,19 +621,20 @@ get_sanitized_ring(const struct domain *d, xen_argo_ring_t *ring,
 }
 
 static unsigned int
-ringbuf_payload_space(const struct domain *d, struct argo_ring_info *ring_info)
+ringbuf_payload_space(const struct domain *d, const struct argo_link *link,
+                      struct argo_ring_info *ring_info)
 {
     xen_argo_ring_t ring;
     unsigned int len;
     int ret;
 
-    ASSERT(LOCKING_L4(d, ring_info));
+    ASSERT(LOCKING_L4(d, link, ring_info));
 
     len = ring_info->len;
     if ( !len )
         return 0;
 
-    if ( get_sanitized_ring(d, &ring, ring_info) )
+    if ( get_sanitized_ring(d, link, &ring, ring_info) )
         return 0;
 
     argo_dprintk("sanitized ringbuf_payload_space: tx_ptr=%u rx_ptr=%u\n",
@@ -707,7 +731,8 @@ iov_count(const xen_argo_iov_t *piov, unsigned int niov,
 }
 
 static int
-ringbuf_insert(const struct domain *d, struct argo_ring_info *ring_info,
+ringbuf_insert(const struct domain *d, const struct argo_link *link,
+               struct argo_ring_info *ring_info,
                const struct argo_ring_id *src_id, xen_argo_iov_t *iovs,
                unsigned int niov, uint32_t message_type, unsigned int len)
 {
@@ -717,7 +742,7 @@ ringbuf_insert(const struct domain *d, struct argo_ring_info *ring_info,
     xen_argo_iov_t *piov;
     XEN_GUEST_HANDLE(uint8) NULL_hnd = { };
 
-    ASSERT(LOCKING_L4(d, ring_info));
+    ASSERT(LOCKING_L4(d, link, ring_info));
 
     /*
      * Enforced below: no more than 'len' bytes of guest data
@@ -734,7 +759,7 @@ ringbuf_insert(const struct domain *d, struct argo_ring_info *ring_info,
                             ROUNDUP_MESSAGE(len)) )
         return -EMSGSIZE;
 
-    ret = get_sanitized_ring(d, &ring, ring_info);
+    ret = get_sanitized_ring(d, link, &ring, ring_info);
     if ( ret )
         return ret;
 
@@ -779,7 +804,7 @@ ringbuf_insert(const struct domain *d, struct argo_ring_info *ring_info,
      * This cannot overrun because the available free space (value in 'sp')
      * is checked above and must be at least this size.
      */
-    ret = memcpy_to_guest_ring(d, ring_info,
+    ret = memcpy_to_guest_ring(d, link, ring_info,
                                ring.tx_ptr + sizeof(xen_argo_ring_t),
                                &mh, NULL_hnd, sizeof(mh));
     if ( ret )
@@ -836,7 +861,7 @@ ringbuf_insert(const struct domain *d, struct argo_ring_info *ring_info,
              * which is the exact full amount of free space available at the
              * tail of the ring, so this cannot overrun.
              */
-            ret = memcpy_to_guest_ring(d, ring_info,
+            ret = memcpy_to_guest_ring(d, link, ring_info,
                                        ring.tx_ptr + sizeof(xen_argo_ring_t),
                                        NULL, buf_hnd, sp);
             if ( ret )
@@ -880,7 +905,7 @@ ringbuf_insert(const struct domain *d, struct argo_ring_info *ring_info,
          *    ie. less than available space at the tail of the ring:
          *        so this write cannot overrun.
          */
-        ret = memcpy_to_guest_ring(d, ring_info,
+        ret = memcpy_to_guest_ring(d, link, ring_info,
                                    ring.tx_ptr + sizeof(xen_argo_ring_t),
                                    NULL, buf_hnd, iov_len);
         if ( ret )
@@ -908,12 +933,12 @@ ringbuf_insert(const struct domain *d, struct argo_ring_info *ring_info,
     if ( ring.tx_ptr >= ring_info->len )
         ring.tx_ptr -= ring_info->len;
 
-    update_tx_ptr(d, ring_info, ring.tx_ptr);
+    update_tx_ptr(d, link, ring_info, ring.tx_ptr);
 
     /*
      * At this point (and also on an error exit paths from this function) it is
      * possible to unmap the ring_info, ie:
-     *   ring_unmap(d, ring_info);
+     *   ring_unmap(d, link, ring_info);
      * but performance should be improved by not doing so, and retaining
      * the mapping.
      * An XSM policy control over level of confidentiality required
@@ -962,11 +987,12 @@ wildcard_pending_list_insert(domid_t domain_id, struct pending_ent *ent)
 }
 
 static void
-pending_remove_all(const struct domain *d, struct argo_ring_info *ring_info)
+pending_remove_all(const struct domain *d, const struct argo_link *link,
+                   struct argo_ring_info *ring_info)
 {
     struct pending_ent *ent;
 
-    ASSERT(LOCKING_L4(d, ring_info));
+    ASSERT(LOCKING_L4(d, link, ring_info));
 
     /* Delete all pending notifications from this ring's list. */
     while ( (ent = list_first_entry_or_null(&ring_info->pending,
@@ -999,12 +1025,13 @@ pending_notify(struct list_head *to_notify)
 }
 
 static void
-pending_find(const struct domain *d, struct argo_ring_info *ring_info,
-             unsigned int payload_space, struct list_head *to_notify)
+pending_find(const struct domain *d, const struct argo_link *link,
+             struct argo_ring_info *ring_info, unsigned int payload_space,
+             struct list_head *to_notify)
 {
     struct pending_ent *ent, *next;
 
-    ASSERT(LOCKING_Read_rings_L3(d));
+    ASSERT(LOCKING_Read_rings_L3(d, link));
 
     /*
      * TODO: Current policy here is to signal _all_ of the waiting domains
@@ -1040,12 +1067,13 @@ pending_find(const struct domain *d, struct argo_ring_info *ring_info,
 }
 
 static int
-pending_queue(const struct domain *d, struct argo_ring_info *ring_info,
-              domid_t src_id, unsigned int len)
+pending_queue(const struct domain *d, const struct argo_link *link,
+              struct argo_ring_info *ring_info, domid_t src_id,
+              unsigned int len)
 {
     struct pending_ent *ent;
 
-    ASSERT(LOCKING_L4(d, ring_info));
+    ASSERT(LOCKING_L4(d, link, ring_info));
 
     if ( ring_info->npending >= MAX_PENDING_PER_RING )
         return -EBUSY;
@@ -1067,12 +1095,13 @@ pending_queue(const struct domain *d, struct argo_ring_info *ring_info,
 }
 
 static int
-pending_requeue(const struct domain *d, struct argo_ring_info *ring_info,
+pending_requeue(const struct domain *d, const struct argo_link *link,
+                struct argo_ring_info *ring_info,
                 domid_t src_id, unsigned int len)
 {
     struct pending_ent *ent;
 
-    ASSERT(LOCKING_L4(d, ring_info));
+    ASSERT(LOCKING_L4(d, link, ring_info));
 
     /* List structure is not modified here. Update len in a match if found. */
     list_for_each_entry(ent, &ring_info->pending, node)
@@ -1096,16 +1125,16 @@ pending_requeue(const struct domain *d, struct argo_ring_info *ring_info,
         }
     }
 
-    return pending_queue(d, ring_info, src_id, len);
+    return pending_queue(d, link, ring_info, src_id, len);
 }
 
 static void
-pending_cancel(const struct domain *d, struct argo_ring_info *ring_info,
-               domid_t src_id)
+pending_cancel(const struct domain *d, const struct argo_link *link,
+               struct argo_ring_info *ring_info, domid_t src_id)
 {
     struct pending_ent *ent, *next;
 
-    ASSERT(LOCKING_L4(d, ring_info));
+    ASSERT(LOCKING_L4(d, link, ring_info));
 
     /* Remove all ents where domain_id matches src_id from the ring's list. */
     list_for_each_entry_safe(ent, next, &ring_info->pending, node)
@@ -1147,11 +1176,12 @@ wildcard_rings_pending_remove(struct domain *d)
 }
 
 static void
-ring_remove_mfns(const struct domain *d, struct argo_ring_info *ring_info)
+ring_remove_mfns(const struct domain *d, const struct argo_link *link,
+                 struct argo_ring_info *ring_info)
 {
     unsigned int i;
 
-    ASSERT(LOCKING_Write_rings_L3(d));
+    ASSERT(LOCKING_Write_rings_L3(d, link));
 
     if ( !ring_info->mfns )
         return;
@@ -1162,7 +1192,7 @@ ring_remove_mfns(const struct domain *d, struct argo_ring_info *ring_info)
         return;
     }
 
-    ring_unmap(d, ring_info);
+    ring_unmap(d, link, ring_info);
 
     for ( i = 0; i < ring_info->nmfns; i++ )
         if ( !mfn_eq(ring_info->mfns[i], INVALID_MFN) )
@@ -1174,13 +1204,14 @@ ring_remove_mfns(const struct domain *d, struct argo_ring_info *ring_info)
 }
 
 static void
-ring_remove_info(const struct domain *d, struct argo_ring_info *ring_info)
+ring_remove_info(const struct domain *d, const struct argo_link *link,
+                 struct argo_ring_info *ring_info)
 {
-    ASSERT(LOCKING_Write_rings_L3(d));
+    ASSERT(LOCKING_Write_rings_L3(d, link));
 
-    pending_remove_all(d, ring_info);
+    pending_remove_all(d, link, ring_info);
     list_del(&ring_info->node);
-    ring_remove_mfns(d, ring_info);
+    ring_remove_mfns(d, link, ring_info);
     xfree(ring_info);
 }
 
@@ -1188,18 +1219,21 @@ static void
 domain_rings_remove_all(struct domain *d)
 {
     unsigned int i;
+    struct argo_link *link;
 
     ASSERT(LOCKING_Write_L1);
+
+    link = d->argo->link;
 
     for ( i = 0; i < ARGO_HASHTABLE_SIZE; ++i )
     {
         struct argo_ring_info *ring_info;
-        struct list_head *bucket = &d->argo->ring_hash[i];
+        struct list_head *bucket = &link->ring_hash[i];
 
         while ( (ring_info = list_first_entry_or_null(bucket,
                                                       struct argo_ring_info,
                                                       node)) )
-            ring_remove_info(d, ring_info);
+            ring_remove_info(d, link, ring_info);
     }
     d->argo->ring_count = 0;
 }
@@ -1210,6 +1244,7 @@ fill_ring_data(const struct domain *currd,
 {
     xen_argo_ring_data_ent_t ent;
     struct domain *dst_d;
+    struct argo_link *link;
     struct argo_ring_info *ring_info;
     struct argo_ring_id id;
     int ret = 0;
@@ -1244,9 +1279,12 @@ fill_ring_data(const struct domain *currd,
     id.partner_id = dst_d->domain_id;
     id.aport = ent.ring.aport;
 
-    read_lock(&dst_d->argo->rings_L3_rwlock);
+    read_lock(&dst_d->argo->links_L2_rwlock);
+    link = dst_d->argo->link;
 
-    ring_info = find_ring_info_by_match(dst_d, &id);
+    read_lock(&link->rings_L3_rwlock);
+
+    ring_info = find_ring_info_by_match(dst_d, link, &id);
     if ( ring_info )
     {
         unsigned int space_avail;
@@ -1262,7 +1300,7 @@ fill_ring_data(const struct domain *currd,
         if ( ring_info->id.partner_id == XEN_ARGO_DOMID_ANY )
             ent.flags |= XEN_ARGO_RING_SHARED;
 
-        space_avail = ringbuf_payload_space(dst_d, ring_info);
+        space_avail = ringbuf_payload_space(dst_d, link, ring_info);
 
         argo_dprintk("fill_ring_data: aport=%x space_avail=%u"
                      " space_wanted=%u\n",
@@ -1273,12 +1311,12 @@ fill_ring_data(const struct domain *currd,
             ent.flags |= XEN_ARGO_RING_EMSGSIZE;
         else if ( space_avail >= ent.space_required )
         {
-            pending_cancel(dst_d, ring_info, currd->domain_id);
+            pending_cancel(dst_d, link, ring_info, currd->domain_id);
             ent.flags |= XEN_ARGO_RING_SUFFICIENT;
         }
         else
         {
-            ret = pending_requeue(dst_d, ring_info, currd->domain_id,
+            ret = pending_requeue(dst_d, link, ring_info, currd->domain_id,
                                   ent.space_required);
             if ( ret == -EBUSY )
             {
@@ -1299,7 +1337,8 @@ fill_ring_data(const struct domain *currd,
             ent.flags |= XEN_ARGO_RING_EMPTY;
 
     }
-    read_unlock(&dst_d->argo->rings_L3_rwlock);
+    read_unlock(&link->rings_L3_rwlock);
+    read_unlock(&dst_d->argo->links_L2_rwlock);
 
  out:
     if ( dst_d )
@@ -1340,8 +1379,8 @@ find_ring_mfn(struct domain *d, gfn_t gfn, mfn_t *mfn)
 }
 
 static int
-find_ring_mfns(struct domain *d, struct argo_ring_info *ring_info,
-               const unsigned int npage,
+find_ring_mfns(struct domain *d, const struct argo_link *link,
+               struct argo_ring_info *ring_info, const unsigned int npage,
                XEN_GUEST_HANDLE_PARAM(xen_argo_gfn_t) gfn_hnd,
                const unsigned int len)
 {
@@ -1350,7 +1389,7 @@ find_ring_mfns(struct domain *d, struct argo_ring_info *ring_info,
     mfn_t *mfns;
     void **mfn_mapping;
 
-    ASSERT(LOCKING_Write_rings_L3(d));
+    ASSERT(LOCKING_Write_rings_L3(d, link));
 
     if ( ring_info->mfns )
     {
@@ -1360,7 +1399,7 @@ find_ring_mfns(struct domain *d, struct argo_ring_info *ring_info,
                      d->domain_id, ring_info->id.domain_id,
                      ring_info->id.aport, ring_info->id.partner_id);
 
-        ring_remove_mfns(d, ring_info);
+        ring_remove_mfns(d, link, ring_info);
         ASSERT(!ring_info->mfns);
     }
 
@@ -1410,7 +1449,7 @@ find_ring_mfns(struct domain *d, struct argo_ring_info *ring_info,
     ring_info->nmfns = i;
 
     if ( ret )
-        ring_remove_mfns(d, ring_info);
+        ring_remove_mfns(d, link, ring_info);
     else
     {
         ASSERT(ring_info->nmfns == NPAGES_RING(len));
@@ -1430,6 +1469,7 @@ unregister_ring(struct domain *currd,
                 XEN_GUEST_HANDLE_PARAM(xen_argo_unregister_ring_t) unreg_hnd)
 {
     xen_argo_unregister_ring_t unreg;
+    struct argo_link *link;
     struct argo_ring_id ring_id;
     struct argo_ring_info *ring_info = NULL;
 
@@ -1453,20 +1493,25 @@ unregister_ring(struct domain *currd,
         return -ENODEV;
     }
 
-    write_lock(&currd->argo->rings_L3_rwlock);
+    read_lock(&currd->argo->links_L2_rwlock);
+    link = currd->argo->link;
 
-    ring_info = find_ring_info(currd, &ring_id);
+    write_lock(&link->rings_L3_rwlock);
+
+    ring_info = find_ring_info(currd, link, &ring_id);
     if ( !ring_info )
         goto out;
 
-    ring_remove_info(currd, ring_info);
+    ring_remove_info(currd, link, ring_info);
 
     spin_lock(&currd->argo->count_L2_lock);
     currd->argo->ring_count--;
     spin_unlock(&currd->argo->count_L2_lock);
 
  out:
-    write_unlock(&currd->argo->rings_L3_rwlock);
+    write_unlock(&link->rings_L3_rwlock);
+
+    read_unlock(&currd->argo->links_L2_rwlock);
 
     read_unlock(&L1_global_argo_rwlock);
 
@@ -1490,6 +1535,7 @@ register_ring(struct domain *currd,
     struct argo_ring_id ring_id;
     void *map_ringp;
     xen_argo_ring_t *ringp;
+    struct argo_link *link;
     struct argo_ring_info *ring_info, *new_ring_info = NULL;
     struct domain *dst_d = NULL;
     int ret = 0;
@@ -1574,7 +1620,10 @@ register_ring(struct domain *currd,
         goto out_unlock;
     }
 
-    write_lock(&currd->argo->rings_L3_rwlock);
+    read_lock(&currd->argo->links_L2_rwlock);
+    link = currd->argo->link;
+
+    write_lock(&link->rings_L3_rwlock);
 
     /* Minimize criticial region for count_L2: do an optimistic increment */
     spin_lock(&currd->argo->count_L2_lock);
@@ -1589,7 +1638,7 @@ register_ring(struct domain *currd,
     if ( ret )
         goto out_unlock2;
 
-    ring_info = find_ring_info(currd, &ring_id);
+    ring_info = find_ring_info(currd, link, &ring_id);
     if ( !ring_info )
     {
         ring_info = new_ring_info;
@@ -1601,7 +1650,7 @@ register_ring(struct domain *currd,
         INIT_LIST_HEAD(&ring_info->pending);
 
         list_add(&ring_info->node,
-                 &currd->argo->ring_hash[hash_index(&ring_info->id)]);
+                 &link->ring_hash[hash_index(&ring_info->id)]);
 
         argo_dprintk("argo: vm%u registering ring (vm%u:%x vm%u)\n",
                      currd->domain_id, ring_id.domain_id, ring_id.aport,
@@ -1648,7 +1697,7 @@ register_ring(struct domain *currd,
                      ring_id.partner_id);
     }
 
-    ret = find_ring_mfns(currd, ring_info, npage, gfn_hnd, reg.len);
+    ret = find_ring_mfns(currd, link, ring_info, npage, gfn_hnd, reg.len);
     if ( ret )
     {
         gprintk(XENLOG_ERR,
@@ -1656,7 +1705,7 @@ register_ring(struct domain *currd,
                 currd->domain_id, ring_id.domain_id, ring_id.aport,
                 ring_id.partner_id);
 
-        ring_remove_info(currd, ring_info);
+        ring_remove_info(currd, link, ring_info);
         goto out_undo;
     }
 
@@ -1664,7 +1713,7 @@ register_ring(struct domain *currd,
      * The first page of the memory supplied for the ring has the xen_argo_ring
      * structure at its head, which is where the ring indexes reside.
      */
-    ret = ring_map_page(currd, ring_info, 0, &map_ringp);
+    ret = ring_map_page(currd, link, ring_info, 0, &map_ringp);
     if ( ret )
     {
         gprintk(XENLOG_ERR,
@@ -1672,7 +1721,7 @@ register_ring(struct domain *currd,
                 currd->domain_id, ring_id.domain_id, ring_id.aport,
                 ring_id.partner_id);
 
-        ring_remove_info(currd, ring_info);
+        ring_remove_info(currd, link, ring_info);
         goto out_undo;
     }
     ringp = map_ringp;
@@ -1692,7 +1741,7 @@ register_ring(struct domain *currd,
         if ( private_tx_ptr >= reg.len )
             private_tx_ptr = 0;
 
-        update_tx_ptr(currd, ring_info, private_tx_ptr);
+        update_tx_ptr(currd, link, ring_info, private_tx_ptr);
     }
 
     ring_info->tx_ptr = private_tx_ptr;
@@ -1708,7 +1757,8 @@ register_ring(struct domain *currd,
     }
 
  out_unlock2:
-    write_unlock(&currd->argo->rings_L3_rwlock);
+    write_unlock(&link->rings_L3_rwlock);
+    read_unlock(&currd->argo->links_L2_rwlock);
 
  out_unlock:
     read_unlock(&L1_global_argo_rwlock);
@@ -1723,47 +1773,54 @@ register_ring(struct domain *currd,
 }
 
 static void
-notify_ring(const struct domain *d, struct argo_ring_info *ring_info,
-            struct list_head *to_notify)
+notify_ring(const struct domain *d, const struct argo_link *link,
+            struct argo_ring_info *ring_info, struct list_head *to_notify)
 {
     unsigned int space;
 
-    ASSERT(LOCKING_Read_rings_L3(d));
+    ASSERT(LOCKING_Read_rings_L3(d, link));
 
     spin_lock(&ring_info->L4_lock);
 
     if ( ring_info->len )
-        space = ringbuf_payload_space(d, ring_info);
+        space = ringbuf_payload_space(d, link, ring_info);
     else
         space = 0;
 
     spin_unlock(&ring_info->L4_lock);
 
     if ( space )
-        pending_find(d, ring_info, space, to_notify);
+        pending_find(d, link, ring_info, space, to_notify);
 }
 
 static void
 notify_check_pending(struct domain *d)
 {
     unsigned int i;
+    struct argo_link *link;
     LIST_HEAD(to_notify);
 
     ASSERT(LOCKING_Read_L1);
 
-    read_lock(&d->argo->rings_L3_rwlock);
+    read_lock(&d->argo->links_L2_rwlock);
+
+    link = d->argo->link;
+
+    read_lock(&link->rings_L3_rwlock);
 
     /* Walk all rings, call notify_ring on each to populate to_notify list */
     for ( i = 0; i < ARGO_HASHTABLE_SIZE; i++ )
     {
         struct argo_ring_info *ring_info, *next;
-        struct list_head *bucket = &d->argo->ring_hash[i];
+        struct list_head *bucket = &link->ring_hash[i];
 
         list_for_each_entry_safe(ring_info, next, bucket, node)
-            notify_ring(d, ring_info, &to_notify);
+            notify_ring(d, link, ring_info, &to_notify);
     }
 
-    read_unlock(&d->argo->rings_L3_rwlock);
+    read_unlock(&link->rings_L3_rwlock);
+
+    read_unlock(&d->argo->links_L2_rwlock);
 
     if ( !list_empty(&to_notify) )
         pending_notify(&to_notify);
@@ -1831,6 +1888,7 @@ sendv(struct domain *src_d, xen_argo_addr_t *src_addr,
       uint32_t message_type)
 {
     struct domain *dst_d = NULL;
+    struct argo_link *link;
     struct argo_ring_id src_id, dst_id;
     struct argo_ring_info *ring_info;
     int ret = 0;
@@ -1889,9 +1947,12 @@ sendv(struct domain *src_d, xen_argo_addr_t *src_addr,
     dst_id.partner_id = src_id.domain_id;
     dst_id.aport = dst_addr->aport;
 
-    read_lock(&dst_d->argo->rings_L3_rwlock);
+    read_lock(&dst_d->argo->links_L2_rwlock);
+    link = dst_d->argo->link;
 
-    ring_info = find_ring_info_by_match(dst_d, &dst_id);
+    read_lock(&link->rings_L3_rwlock);
+
+    ring_info = find_ring_info_by_match(dst_d, link, &dst_id);
     if ( !ring_info )
     {
         gprintk(XENLOG_ERR,
@@ -1912,7 +1973,7 @@ sendv(struct domain *src_d, xen_argo_addr_t *src_addr,
         ret = iov_count(iovs, niov, &len);
         if ( !ret )
         {
-            ret = ringbuf_insert(dst_d, ring_info, &src_id, iovs, niov,
+            ret = ringbuf_insert(dst_d, link, ring_info, &src_id, iovs, niov,
                                  message_type, len);
             if ( ret == -EAGAIN )
             {
@@ -1920,7 +1981,7 @@ sendv(struct domain *src_d, xen_argo_addr_t *src_addr,
 
                 argo_dprintk("argo_ringbuf_sendv failed, EAGAIN\n");
                 /* requeue to issue a notification when space is there */
-                rc = pending_requeue(dst_d, ring_info, src_id.domain_id, len);
+                rc = pending_requeue(dst_d, link, ring_info, src_id.domain_id, len);
                 if ( rc )
                     ret = rc;
             }
@@ -1929,7 +1990,8 @@ sendv(struct domain *src_d, xen_argo_addr_t *src_addr,
         spin_unlock(&ring_info->L4_lock);
     }
 
-    read_unlock(&dst_d->argo->rings_L3_rwlock);
+    read_unlock(&link->rings_L3_rwlock);
+    read_unlock(&dst_d->argo->links_L2_rwlock);
 
  out_unlock:
     read_unlock(&L1_global_argo_rwlock);
@@ -2152,12 +2214,13 @@ argo_domain_init(struct argo_domain *argo)
 {
     unsigned int i;
 
-    rwlock_init(&argo->rings_L3_rwlock);
+    rwlock_init(&argo->links_L2_rwlock);
+    rwlock_init(&argo->link->rings_L3_rwlock);
     spin_lock_init(&argo->wildcard_L2_lock);
     spin_lock_init(&argo->count_L2_lock);
 
     for ( i = 0; i < ARGO_HASHTABLE_SIZE; ++i )
-        INIT_LIST_HEAD(&argo->ring_hash[i]);
+        INIT_LIST_HEAD(&argo->link->ring_hash[i]);
 
     INIT_LIST_HEAD(&argo->wildcard_pend_list);
 }
@@ -2178,6 +2241,13 @@ argo_init(struct domain *d)
     argo = xzalloc(struct argo_domain);
     if ( !argo )
         return -ENOMEM;
+
+    argo->link = xzalloc(struct argo_link);
+    if ( !argo->link )
+    {
+        XFREE(argo);
+        return -ENOMEM;
+    }
 
     argo_domain_init(argo);
 
@@ -2203,6 +2273,7 @@ argo_destroy(struct domain *d)
     {
         domain_rings_remove_all(d);
         wildcard_rings_pending_remove(d);
+        xfree(d->argo->link);
         XFREE(d->argo);
     }
 
