@@ -167,8 +167,31 @@ struct argo_domain
 {
     /* links_L2 */
     rwlock_t links_L2_rwlock;
-    /* A single link. Protected by links_L2. */
-    struct argo_link *link;
+    /*
+     * Two hash tables of argo_link structs for domains that this domain has
+     * registered rings to receive messages from. Both protected by links_L2.
+     * The reason that there are two hashtables is to support the strategy
+     * for avoiding deadlock when accessing the argo_links structs that are
+     * shared between two domains.
+     *
+     * The upper_links_hash hashtable contains struct argo_links that are each
+     * shared with another domain where that other domain has a domid that is
+     * numerically higher than this domain's domid.
+     * The lower_links_hash hashtable contains struct argo_links that are each
+     * shared with another domain where that other domain has a domid that is
+     * numerically lower than this domain's domid.
+     *
+     * In addition to those described just above, the lower_links_hash may also
+     * contain a single struct argo_link for managing rings that a domain has
+     * registered for communication with itself (ie. partner_id == domain_id).
+     * This self-link is not shared with any other domain.
+     *
+     * The upper_links_hash may also contain a single struct argo_link for
+     * managing all the wildcard rings that a domain has registered.
+     * This wildcard-link is not shared with any other domain.
+     */
+    struct list_head upper_links_hash[ARGO_HASHTABLE_SIZE];
+    struct list_head lower_links_hash[ARGO_HASHTABLE_SIZE];
 
     /* count_L2 */
     spinlock_t count_L2_lock;
@@ -184,12 +207,35 @@ struct argo_domain
     struct list_head wildcard_pend_list;
 };
 
+/*
+ * The argo_link struct is shared between two communicating domains, and tracks
+ * all the non-wildcard rings that are registered to communcate between them.
+ * An additional argo_link struct is allocated for each domain to track the
+ * wildcard rings that it has registered.
+ *
+ * The domids of the two domains are stored within the struct, with the
+ * numerically higher valued domid in 'upper_domain_id' and the other in
+ * 'lower_domain_id'.
+ * The list_heads allow the struct to be stored within each domain's hashtable:
+ *      upper_d->argo->lower_links_hash[link_index(lower_d->domid)]
+ *      lower_d->argo->upper_links_hash[link_index(upper_d->domid)]
+ */
 struct argo_link
 {
+    /*
+     * Next nodes in domain's partner hashes.
+     * upper_node is protected by upper_d->links_L2.
+     * lower_node is protected by lower_d->links_L2.
+     */
+    struct list_head upper_node, lower_node;
+    /* Domain ids: values are not modified after struct initialization. */
+    domid_t upper_domain_id, lower_domain_id;
+
     /* rings_L3 */
     rwlock_t rings_L3_rwlock;
     /*
-     * Hash table of argo_ring_info about rings this domain has registered.
+     * Hash table of argo_ring_info about rings this pair of domains
+     * have registered for communication between them.
      * Protected by rings_L3.
      */
     struct list_head ring_hash[ARGO_HASHTABLE_SIZE];
@@ -220,7 +266,17 @@ static DEFINE_RWLOCK(L1_global_argo_rwlock); /* L1 */
 /*
  * == links_L2 : The per-domain link hash lock: d->argo->links_L2_rwlock
  *
- * Holding a read lock on links_L2 protects the link: d->argo->link
+ * Holding a read lock on links_L2 protects the links hashtables:
+ *  d->argo->upper_links_hash and d->argo->lower_links_hash
+ * and the upper_node and lower_node fields in struct argo_link within the
+ * hash tables.
+ * To write to the argo_link, write locks must be acquired on _both_ the
+ * links_L2 locks of the domains that share the link. To avoid deadlock,
+ * the links_L2_lock on the domain with the numerically higher domid must be
+ * acquired first.
+ * nb: Not all links are shared between multiple domains -- specifically
+ *     links for either rings-to-self or wildcard rings are owned by a single
+ *     domain, so those are only protected by a single links_L2 lock.
  *
  * == rings_L3 : The per-link ring hash lock: link->rings_L3_rwlock
  *
@@ -228,10 +284,11 @@ static DEFINE_RWLOCK(L1_global_argo_rwlock); /* L1 */
  * the elements in the hash_table link->ring_hash, and the node and id fields
  * in struct argo_ring_info in the hash table.
  * Holding a write lock on rings_L3 protects all of the elements of all the
- * struct argo_ring_info belonging to this domain.
+ * struct argo_ring_info belonging to this domain and the partner domain
+ * (if any) that shares the link.
  *
  * To take rings_L3 you must already have R(L1) and R(links_L2).
- * W(L1) implies W(rings_L3) and L4.
+ * W(L1) implies W(links_L2), W(rings_L3) and L4.
  *
  * == L4 : The individual ring_info lock: ring_info->L4_lock
  *
@@ -346,6 +403,52 @@ hash_index(const struct argo_ring_id *id)
      * hash to contribute to the lower-order bits before masking off.
      */
     return (hash ^ (hash >> 15)) & (ARGO_HASHTABLE_SIZE - 1);
+}
+
+/* This is not especially efficient... */
+static unsigned int
+link_index(domid_t partner_id)
+{
+    struct argo_ring_id tmp;
+
+    tmp.aport = 0;
+    tmp.domain_id = 0;
+    tmp.partner_id = partner_id;
+
+    return hash_index(&tmp);
+}
+
+static struct argo_link *
+find_link(const struct domain *d, domid_t partner_id)
+{
+    struct argo_link *link;
+    const struct list_head *bucket;
+
+    ASSERT(LOCKING_Read_links_L2(d));
+
+    /* List is not modified here. Search and return the match if found. */
+    if ( partner_id > d->domain_id )
+    {
+        bucket = &d->argo->upper_links_hash[link_index(partner_id)];
+
+        list_for_each_entry(link, bucket, upper_node)
+        {
+            if ( link->upper_domain_id == partner_id )
+                return link;
+        }
+    }
+    else
+    {
+        bucket = &d->argo->lower_links_hash[link_index(partner_id)];
+
+        list_for_each_entry(link, bucket, lower_node)
+        {
+            if ( link->lower_domain_id == partner_id )
+                return link;
+        }
+    }
+
+    return NULL;
 }
 
 static struct argo_ring_info *
@@ -1215,15 +1318,18 @@ ring_remove_info(const struct domain *d, const struct argo_link *link,
     xfree(ring_info);
 }
 
+/*
+ * This function does not decrement d->ring_count since it's used only
+ * when removing all rings. The domain's ring count is set to zero afterwards
+ * in domain_rings_remove_all.
+ */
 static void
-domain_rings_remove_all(struct domain *d)
+remove_link_and_rings(const struct domain *d, struct argo_link *link)
 {
+    struct domain *dst_d = NULL;
     unsigned int i;
-    struct argo_link *link;
 
     ASSERT(LOCKING_Write_L1);
-
-    link = d->argo->link;
 
     for ( i = 0; i < ARGO_HASHTABLE_SIZE; ++i )
     {
@@ -1233,8 +1339,56 @@ domain_rings_remove_all(struct domain *d)
         while ( (ring_info = list_first_entry_or_null(bucket,
                                                       struct argo_ring_info,
                                                       node)) )
+        {
+            if ( ring_info->id.domain_id != d->domain_id )
+            {
+                if ( !dst_d )
+                    dst_d = get_domain_by_id(ring_info->id.domain_id);
+
+                ASSERT(dst_d->domain_id == ring_info->id.domain_id);
+
+                /* W(L1) implies W(count_L2) so ok to decrement: */
+                dst_d->argo->ring_count--;
+            }
             ring_remove_info(d, link, ring_info);
+        }
     }
+
+    if ( dst_d )
+        put_domain(dst_d);
+
+    /* Links for self-rings are not present on the upper list */
+    if ( link->upper_domain_id != link->lower_domain_id )
+        list_del(&link->upper_node);
+    /* Links for wildcard rings are not present on the lower list */
+    if ( link->upper_domain_id != XEN_ARGO_DOMID_ANY )
+        list_del(&link->lower_node);
+
+    xfree(link);
+}
+
+static void
+domain_rings_remove_all(struct domain *d)
+{
+    unsigned int i;
+
+    ASSERT(LOCKING_Write_L1);
+
+    for ( i = 0; i < ARGO_HASHTABLE_SIZE; ++i )
+    {
+        struct argo_link *link;
+        struct list_head *bucket = &d->argo->upper_links_hash[i];
+
+        while ( (link = list_first_entry_or_null(bucket, struct argo_link,
+                                                 upper_node) ) )
+            remove_link_and_rings(d, link);
+
+        bucket = &d->argo->lower_links_hash[i];
+        while ( (link = list_first_entry_or_null(bucket, struct argo_link,
+                                                 lower_node) ) )
+            remove_link_and_rings(d, link);
+    }
+
     d->argo->ring_count = 0;
 }
 
@@ -1279,12 +1433,15 @@ fill_ring_data(const struct domain *currd,
     id.partner_id = dst_d->domain_id;
     id.aport = ent.ring.aport;
 
-    read_lock(&dst_d->argo->links_L2_rwlock);
-    link = dst_d->argo->link;
+    read_lock(&currd->argo->links_L2_rwlock);
+
+    link = find_link(currd, dst_d->domain_id);
+    if ( !link )
+        goto out_unlock;
 
     read_lock(&link->rings_L3_rwlock);
 
-    ring_info = find_ring_info_by_match(dst_d, link, &id);
+    ring_info = find_ring_info_by_match(currd, link, &id);
     if ( ring_info )
     {
         unsigned int space_avail;
@@ -1338,7 +1495,9 @@ fill_ring_data(const struct domain *currd,
 
     }
     read_unlock(&link->rings_L3_rwlock);
-    read_unlock(&dst_d->argo->links_L2_rwlock);
+
+ out_unlock:
+    read_unlock(&currd->argo->links_L2_rwlock);
 
  out:
     if ( dst_d )
@@ -1494,13 +1653,16 @@ unregister_ring(struct domain *currd,
     }
 
     read_lock(&currd->argo->links_L2_rwlock);
-    link = currd->argo->link;
+
+    link = find_link(currd, unreg.partner_id);
+    if ( !link )
+        goto out;
 
     write_lock(&link->rings_L3_rwlock);
 
     ring_info = find_ring_info(currd, link, &ring_id);
     if ( !ring_info )
-        goto out;
+        goto out2;
 
     ring_remove_info(currd, link, ring_info);
 
@@ -1508,9 +1670,10 @@ unregister_ring(struct domain *currd,
     currd->argo->ring_count--;
     spin_unlock(&currd->argo->count_L2_lock);
 
- out:
+ out2:
     write_unlock(&link->rings_L3_rwlock);
 
+ out:
     read_unlock(&currd->argo->links_L2_rwlock);
 
     read_unlock(&L1_global_argo_rwlock);
@@ -1521,6 +1684,99 @@ unregister_ring(struct domain *currd,
                      ring_id.domain_id, ring_id.aport, ring_id.partner_id);
         return -ENOENT;
     }
+
+    return 0;
+}
+
+static int
+create_link(struct domain *currd, domid_t partner_id, struct domain *dst_d)
+{
+    struct argo_link *link, *found_link;
+    int i;
+
+    ASSERT(LOCKING_Read_L1);
+
+    link = xmalloc(struct argo_link);
+    if ( !link )
+        return -ENOMEM;
+
+    rwlock_init(&link->rings_L3_rwlock);
+    for ( i = 0; i < ARGO_HASHTABLE_SIZE; ++i )
+        INIT_LIST_HEAD(&link->ring_hash[i]);
+
+    if ( partner_id == XEN_ARGO_DOMID_ANY )
+    {
+        link->upper_domain_id = XEN_ARGO_DOMID_ANY;
+        link->lower_domain_id = currd->domain_id;
+
+        write_lock(&currd->argo->links_L2_rwlock);
+
+        found_link = find_link(currd, partner_id);
+        if ( !found_link )
+            list_add(&link->upper_node, &currd->argo->upper_links_hash[
+                                            link_index(partner_id)]);
+    }
+    else if ( partner_id > currd->domain_id )
+    {
+        ASSERT(dst_d);
+
+        link->upper_domain_id = partner_id;
+        link->lower_domain_id = currd->domain_id;
+
+        /* Deadlock avoidance: lock domain with higher-numbered id first. */
+        write_lock(&dst_d->argo->links_L2_rwlock);
+        write_lock(&currd->argo->links_L2_rwlock);
+
+        found_link = find_link(currd, partner_id);
+        if ( !found_link )
+        {
+            list_add(&link->upper_node, &currd->argo->upper_links_hash[
+                                            link_index(partner_id)]);
+            list_add(&link->lower_node, &dst_d->argo->lower_links_hash[
+                                            link_index(currd->domain_id)]);
+        }
+        write_unlock(&dst_d->argo->links_L2_rwlock);
+    }
+    else if ( partner_id < currd->domain_id )
+    {
+        ASSERT(dst_d);
+
+        link->upper_domain_id = currd->domain_id;
+        link->lower_domain_id = partner_id;
+
+        /* Deadlock avoidance: lock domain with higher-numbered id first. */
+        write_lock(&currd->argo->links_L2_rwlock);
+
+        found_link = find_link(currd, partner_id);
+        if ( !found_link )
+        {
+            write_lock(&dst_d->argo->links_L2_rwlock);
+
+            list_add(&link->upper_node, &dst_d->argo->upper_links_hash[
+                                            link_index(currd->domain_id)]);
+            list_add(&link->lower_node, &currd->argo->lower_links_hash[
+                                            link_index(partner_id)]);
+
+            write_unlock(&dst_d->argo->links_L2_rwlock);
+        }
+    }
+    else /* ( partner_id == currd->domain_id ) */
+    {
+        link->upper_domain_id = currd->domain_id;
+        link->lower_domain_id = currd->domain_id;
+
+        write_lock(&currd->argo->links_L2_rwlock);
+
+        found_link = find_link(currd, partner_id);
+        if ( !found_link )
+            list_add(&link->lower_node, &currd->argo->lower_links_hash[
+                                            link_index(partner_id)]);
+    }
+
+    write_unlock(&currd->argo->links_L2_rwlock);
+
+    if ( found_link )
+        xfree(link);
 
     return 0;
 }
@@ -1621,7 +1877,30 @@ register_ring(struct domain *currd,
     }
 
     read_lock(&currd->argo->links_L2_rwlock);
-    link = currd->argo->link;
+
+    link = find_link(currd, reg.partner_id);
+    if ( !link )
+    {
+        read_unlock(&currd->argo->links_L2_rwlock);
+
+        ret = create_link(currd, reg.partner_id, dst_d);
+        if ( ret )
+            goto out_unlock;
+        /*
+         * We don't have to worry about the new link being removed while the
+         * links_L2_lock was dropped because we held R(L1) and links are only
+         * removed when a domain is destroyed, which acquires W(L1).
+         */
+        read_lock(&currd->argo->links_L2_rwlock);
+
+        link = find_link(currd, reg.partner_id);
+        if ( !link )
+        {
+            ASSERT_UNREACHABLE();
+            ret = -ECONNREFUSED;
+            goto out_unlock2;
+        }
+    }
 
     write_lock(&link->rings_L3_rwlock);
 
@@ -1636,7 +1915,7 @@ register_ring(struct domain *currd,
     spin_unlock(&currd->argo->count_L2_lock);
 
     if ( ret )
-        goto out_unlock2;
+        goto out_unlock3;
 
     ring_info = find_ring_info(currd, link, &ring_id);
     if ( !ring_info )
@@ -1756,8 +2035,10 @@ register_ring(struct domain *currd,
         spin_unlock(&currd->argo->count_L2_lock);
     }
 
- out_unlock2:
+ out_unlock3:
     write_unlock(&link->rings_L3_rwlock);
+
+ out_unlock2:
     read_unlock(&currd->argo->links_L2_rwlock);
 
  out_unlock:
@@ -1796,29 +2077,53 @@ notify_ring(const struct domain *d, const struct argo_link *link,
 static void
 notify_check_pending(struct domain *d)
 {
-    unsigned int i;
-    struct argo_link *link;
+    unsigned int i, j;
     LIST_HEAD(to_notify);
 
     ASSERT(LOCKING_Read_L1);
 
     read_lock(&d->argo->links_L2_rwlock);
 
-    link = d->argo->link;
-
-    read_lock(&link->rings_L3_rwlock);
-
     /* Walk all rings, call notify_ring on each to populate to_notify list */
     for ( i = 0; i < ARGO_HASHTABLE_SIZE; i++ )
     {
-        struct argo_ring_info *ring_info, *next;
-        struct list_head *bucket = &link->ring_hash[i];
+        struct argo_link *link, *next;
+        struct list_head *link_bucket = &d->argo->upper_links_hash[i];
 
-        list_for_each_entry_safe(ring_info, next, bucket, node)
-            notify_ring(d, link, ring_info, &to_notify);
+        list_for_each_entry_safe(link, next, link_bucket, upper_node)
+        {
+            read_lock(&link->rings_L3_rwlock);
+
+            for ( j = 0; j < ARGO_HASHTABLE_SIZE; j++ )
+            {
+                struct argo_ring_info *ring_info, *next;
+                struct list_head *ring_bucket = &link->ring_hash[j];
+
+                list_for_each_entry_safe(ring_info, next, ring_bucket, node)
+                    notify_ring(d, link, ring_info, &to_notify);
+            }
+
+            read_unlock(&link->rings_L3_rwlock);
+        }
+
+        link_bucket = &d->argo->lower_links_hash[i];
+
+        list_for_each_entry_safe(link, next, link_bucket, lower_node)
+        {
+            read_lock(&link->rings_L3_rwlock);
+
+            for ( j = 0; j < ARGO_HASHTABLE_SIZE; j++ )
+            {
+                struct argo_ring_info *ring_info, *next;
+                struct list_head *ring_bucket = &link->ring_hash[j];
+
+                list_for_each_entry_safe(ring_info, next, ring_bucket, node)
+                    notify_ring(d, link, ring_info, &to_notify);
+            }
+
+            read_unlock(&link->rings_L3_rwlock);
+        }
     }
-
-    read_unlock(&link->rings_L3_rwlock);
 
     read_unlock(&d->argo->links_L2_rwlock);
 
@@ -1943,16 +2248,22 @@ sendv(struct domain *src_d, xen_argo_addr_t *src_addr,
         goto out_unlock;
     }
 
+    read_lock(&src_d->argo->links_L2_rwlock);
+
+    link = find_link(src_d, dst_d->domain_id);
+    if ( !link )
+    {
+        ret = -ECONNREFUSED;
+        goto out_unlock2;
+    }
+
     dst_id.domain_id = dst_d->domain_id;
     dst_id.partner_id = src_id.domain_id;
     dst_id.aport = dst_addr->aport;
 
-    read_lock(&dst_d->argo->links_L2_rwlock);
-    link = dst_d->argo->link;
-
     read_lock(&link->rings_L3_rwlock);
 
-    ring_info = find_ring_info_by_match(dst_d, link, &dst_id);
+    ring_info = find_ring_info_by_match(src_d, link, &dst_id);
     if ( !ring_info )
     {
         gprintk(XENLOG_ERR,
@@ -1981,7 +2292,8 @@ sendv(struct domain *src_d, xen_argo_addr_t *src_addr,
 
                 argo_dprintk("argo_ringbuf_sendv failed, EAGAIN\n");
                 /* requeue to issue a notification when space is there */
-                rc = pending_requeue(dst_d, link, ring_info, src_id.domain_id, len);
+                rc = pending_requeue(dst_d, link, ring_info, src_id.domain_id,
+                                     len);
                 if ( rc )
                     ret = rc;
             }
@@ -1991,7 +2303,9 @@ sendv(struct domain *src_d, xen_argo_addr_t *src_addr,
     }
 
     read_unlock(&link->rings_L3_rwlock);
-    read_unlock(&dst_d->argo->links_L2_rwlock);
+
+ out_unlock2:
+    read_unlock(&src_d->argo->links_L2_rwlock);
 
  out_unlock:
     read_unlock(&L1_global_argo_rwlock);
@@ -2215,13 +2529,14 @@ argo_domain_init(struct argo_domain *argo)
     unsigned int i;
 
     rwlock_init(&argo->links_L2_rwlock);
-    rwlock_init(&argo->link->rings_L3_rwlock);
     spin_lock_init(&argo->wildcard_L2_lock);
     spin_lock_init(&argo->count_L2_lock);
 
     for ( i = 0; i < ARGO_HASHTABLE_SIZE; ++i )
-        INIT_LIST_HEAD(&argo->link->ring_hash[i]);
-
+    {
+        INIT_LIST_HEAD(&argo->upper_links_hash[i]);
+        INIT_LIST_HEAD(&argo->lower_links_hash[i]);
+    }
     INIT_LIST_HEAD(&argo->wildcard_pend_list);
 }
 
@@ -2241,13 +2556,6 @@ argo_init(struct domain *d)
     argo = xzalloc(struct argo_domain);
     if ( !argo )
         return -ENOMEM;
-
-    argo->link = xzalloc(struct argo_link);
-    if ( !argo->link )
-    {
-        XFREE(argo);
-        return -ENOMEM;
-    }
 
     argo_domain_init(argo);
 
@@ -2273,7 +2581,6 @@ argo_destroy(struct domain *d)
     {
         domain_rings_remove_all(d);
         wildcard_rings_pending_remove(d);
-        xfree(d->argo->link);
         XFREE(d->argo);
     }
 
