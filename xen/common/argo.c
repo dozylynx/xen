@@ -482,6 +482,10 @@ find_ring_info(const struct domain *d, const struct argo_link *link,
     return NULL;
 }
 
+/*
+ * FIXME: this is broken now because the wildcard rings are not tracked in the
+ *        same link as the point-to-point links.
+ */
 static struct argo_ring_info *
 find_ring_info_by_match(const struct domain *d, const struct argo_link *link,
                         const struct argo_ring_id *id)
