@@ -1792,11 +1792,12 @@ register_ring(struct domain *currd,
               unsigned int npage, unsigned int flags)
 {
     xen_argo_register_ring_t reg;
-    struct argo_ring_id ring_id;
+    struct argo_ring_id ring_id, fwd_ring_id;
     void *map_ringp;
     xen_argo_ring_t *ringp;
-    struct argo_link *link;
-    struct argo_ring_info *ring_info, *new_ring_info = NULL;
+    struct argo_link *link = NULL, *fwd_link = NULL;
+    struct argo_ring_info *fwd_ring_info = NULL, *ring_info,
+                          *new_ring_info = NULL;
     struct domain *dst_d = NULL;
     int ret = 0;
     unsigned int private_tx_ptr;
@@ -1826,14 +1827,16 @@ register_ring(struct domain *currd,
          (reg.len > XEN_ARGO_MAX_RING_SIZE) ||
          (reg.len != ROUNDUP_MESSAGE(reg.len)) ||
          (NPAGES_RING(reg.len) != npage) ||
-         (reg.pad != 0) )
+         (reg.partner.pad != 0) ||
+         ((flags & XEN_ARGO_REGISTER_FLAG_REPLY_RING) &&
+          (reg.partner.domain_id == XEN_ARGO_DOMID_ANY)) )
         return -EINVAL;
 
-    ring_id.partner_id = reg.partner_id;
+    ring_id.partner_id = reg.partner.domain_id;
     ring_id.aport = reg.aport;
     ring_id.domain_id = currd->domain_id;
 
-    if ( reg.partner_id == XEN_ARGO_DOMID_ANY )
+    if ( reg.partner.domain_id == XEN_ARGO_DOMID_ANY )
     {
         ret = opt_argo_mac_permissive ? xsm_argo_register_any_source(currd) :
                                         -EPERM;
@@ -1842,7 +1845,7 @@ register_ring(struct domain *currd,
     }
     else
     {
-        dst_d = get_domain_by_id(reg.partner_id);
+        dst_d = get_domain_by_id(reg.partner.domain_id);
         if ( !dst_d )
         {
             argo_dprintk("!dst_d, ESRCH\n");
@@ -1880,33 +1883,95 @@ register_ring(struct domain *currd,
         goto out_unlock;
     }
 
-    read_lock(&currd->argo->links_L2_rwlock);
-
-    link = find_link(currd, reg.partner_id);
-    if ( !link )
+    /* For partner rings: ensure that the link between the domains exists */
+    if ( reg.partner.domain_id != XEN_ARGO_DOMID_ANY )
     {
+        bool link_exists;
+
+        read_lock(&currd->argo->links_L2_rwlock);
+        link_exists = !!find_link(currd, reg.partner.domain_id);
         read_unlock(&currd->argo->links_L2_rwlock);
 
-        ret = create_link(currd, reg.partner_id, dst_d);
-        if ( ret )
-            goto out_unlock;
-        /*
-         * We don't have to worry about the new link being removed while the
-         * links_L2_lock was dropped because we held R(L1) and links are only
-         * removed when a domain is destroyed, which acquires W(L1).
-         */
-        read_lock(&currd->argo->links_L2_rwlock);
-
-        link = find_link(currd, reg.partner_id);
-        if ( !link )
+        /* holding R(L1) so link will exist even when links_L2 is dropped */
+        if ( !link_exists )
         {
-            ASSERT_UNREACHABLE();
-            ret = -ECONNREFUSED;
-            goto out_unlock2;
+            ret = create_link(currd, reg.partner.domain_id, dst_d);
+            if ( ret )
+                goto out_unlock;
         }
     }
 
+    /*
+     * Next: acquire all necessary links_L2 and rings_L3 locks.
+     * If registering a reply ring, look up the forward ring and hold the
+     * rings_L3 lock protecting it until registering is completed.
+     *
+     * If the forward ring is a wildcard ring, we need to access it via the
+     * dst_d link for wildcard rings, so must read-lock dst_d's links_L2.
+     * To avoid deadlock, take R(links_L2) on the domain with the
+     * higher-numbered domain id first.
+     */
+    if ( flags & XEN_ARGO_REGISTER_FLAG_REPLY_RING )
+    {
+        /* Populating this before locking to reduce work in critical region */
+        fwd_ring_id.domain_id = reg.partner.domain_id;
+        fwd_ring_id.aport = reg.partner.aport;
+        fwd_ring_id.partner_id = currd->domain_id; /* partner ring */
+
+        /* Lock both links_L2 in deadlock-avoidance order */
+        if ( currd->domain_id > dst_d->domain_id )
+        {
+            read_lock(&currd->argo->links_L2_rwlock);
+            read_lock(&dst_d->argo->links_L2_rwlock);
+        }
+        else if ( currd->domain_id < dst_d->domain_id )
+        {
+            read_lock(&dst_d->argo->links_L2_rwlock);
+            read_lock(&currd->argo->links_L2_rwlock);
+        }
+        else /* ( currd->domain_id == dst_d->domain_id ) */
+            read_lock(&currd->argo->links_L2_rwlock);
+    }
+    else
+        read_lock(&currd->argo->links_L2_rwlock);
+
+    link = find_link(currd, reg.partner.domain_id);
+    ASSERT(link);
+
+    /* This link is where the new ring will go, so write lock it */
     write_lock(&link->rings_L3_rwlock);
+
+    if ( flags & XEN_ARGO_REGISTER_FLAG_REPLY_RING )
+    {
+        fwd_ring_info = find_ring_info(currd, link, &fwd_ring_id);
+        if ( fwd_ring_info )
+            fwd_link = link;
+        else
+        {
+            /* Search dst_d's wildcard ring link */
+            fwd_ring_id.partner_id = XEN_ARGO_DOMID_ANY;
+            fwd_link = find_link(dst_d, XEN_ARGO_DOMID_ANY);
+            if ( fwd_link )
+            {
+                read_lock(&fwd_link->rings_L3_rwlock);
+
+                fwd_ring_info = find_ring_info(dst_d, fwd_link, &fwd_ring_id);
+            }
+            if ( !fwd_ring_info )
+            {
+                if ( fwd_link )
+                    read_unlock(&fwd_link->rings_L3_rwlock);
+
+                ret = -ECONNREFUSED;
+                goto out_unlock2;
+            }
+        }
+    }
+
+    ASSERT(LOCKING_Write_rings_L3(currd, link));
+    ASSERT(!(flags & XEN_ARGO_REGISTER_FLAG_REPLY_RING) ||
+           (currd->domain_id == ring_id.partner_id ) ||
+           LOCKING_Read_rings_L3(dst_d, fwd_link));
 
     /* Minimize criticial region for count_L2: do an optimistic increment */
     spin_lock(&currd->argo->count_L2_lock);
@@ -2041,9 +2106,14 @@ register_ring(struct domain *currd,
 
  out_unlock3:
     write_unlock(&link->rings_L3_rwlock);
+    if ( fwd_link && (fwd_link != link) )
+        read_unlock(&fwd_link->rings_L3_rwlock);
 
  out_unlock2:
     read_unlock(&currd->argo->links_L2_rwlock);
+    if ( (flags & XEN_ARGO_REGISTER_FLAG_REPLY_RING) &&
+         (currd->domain_id != dst_d->domain_id) )
+        read_unlock(&dst_d->argo->links_L2_rwlock);
 
  out_unlock:
     read_unlock(&L1_global_argo_rwlock);

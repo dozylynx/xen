@@ -92,8 +92,7 @@ typedef struct xen_argo_ring
 typedef struct xen_argo_register_ring
 {
     xen_argo_port_t aport;
-    domid_t partner_id;
-    uint16_t pad;
+    struct xen_argo_addr partner;
     uint32_t len;
 } xen_argo_register_ring_t;
 
@@ -189,10 +188,21 @@ struct xen_argo_ring_message_header
  * taking the place of the old, preserving tx_ptr if it remains valid.
  */
 #define XEN_ARGO_REGISTER_FLAG_FAIL_EXIST  0x1
+/*
+ * Reply ring:
+ * If set, this new ring is being registered to enable the reply direction of
+ * bi-directional communication with an existing ring which must be specified.
+ * The other ring must exist or registration of the reply ring will fail.
+ * A reply ring cannot be a wildcard ring.
+ * If the forward direction ring is unregistered, all reply rings to it will
+ * also be unregistered at the same time.
+ */
+#define XEN_ARGO_REGISTER_FLAG_REPLY_RING  0x2
 
 #ifdef __XEN__
 /* Mask for all defined flags. */
-#define XEN_ARGO_REGISTER_FLAG_MASK XEN_ARGO_REGISTER_FLAG_FAIL_EXIST
+#define XEN_ARGO_REGISTER_FLAG_MASK ( XEN_ARGO_REGISTER_FLAG_FAIL_EXIST | \
+                                      XEN_ARGO_REGISTER_FLAG_REPLY_RING )
 #endif
 
 /*
