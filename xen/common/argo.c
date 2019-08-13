@@ -1,3 +1,35 @@
+/* 
+ * Branch contains work-in-progress development/research for CONNECTION-STATE.
+ * Precursor work to ACCESS-CONTROL. Aim: enough to allow enabling Argo by default.
+ *
+ * (dumping core here before setting aside to look at SENDER-DOMAIN-CONTEXT)
+ *
+ * REMINDER / TODO STUFF:
+ *
+ * work so far has just been on 'register_ring'.
+ *  - acquiring/releasing locks is... involved. done first cut version only.
+ *  - sendv will need to check that messages have a header that matches
+ *    rings + reply rings that have been registered before allowing xmit.
+ *  - XSM hook needs extending to understand reply rings for policy control.
+ *
+ * impl notes:
+ * added "argo_link" for sharing a ring hash table between two domains
+ *   - tracks all the partner rings in either direction
+ *   - good for lookup as rings in both dirs can be accessed with readlocks
+ *     on domain's own structures
+ *   - additional two "argo link"s for: own wildcard rings and self rings.
+
+ * - find_ring_info_by_match is busted at the moment because wildcard rings
+ *   aren't tracked in the same link as the partner ring
+ *  => several options for fixing it; to be investigated
+ *    - eg. hook register/unregister to add to/remove from lookup structure
+ * 
+ * - have started on the list of reply rings on the forward ring: thinking:
+ *   use that in unregister to pull down the reply rings when the forward ring
+ *   is unregistered; will also mean that unregistering a reply ring will need
+ *   to drop itself from that list on the forward ring.
+ */
+
 /******************************************************************************
  * Argo : Hypervisor-Mediated data eXchange
  *
