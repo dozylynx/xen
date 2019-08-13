@@ -132,6 +132,12 @@ struct argo_ring_info
     struct list_head pending;
     /* number of pending entries queued for this ring, protected by L4 */
     unsigned int npending;
+    /* is this a reply ring? */
+    bool is_reply;
+    /* list of reply rings to this ring, protected by L4 */
+    struct list_head reply_list;
+    /* node for this ring within a forward ring's reply list, protected by L4 */
+    struct list_head reply_node;
 };
 
 /* A space-available notification that is awaiting sufficient space */
@@ -1823,6 +1829,8 @@ create_ring(struct domain *currd, struct argo_link *link,
 
         ring_info->id = *ring_id;
         INIT_LIST_HEAD(&ring_info->pending);
+        INIT_LIST_HEAD(&ring_info->reply_list);
+        ring_info->is_reply = !!(flags & XEN_ARGO_REGISTER_FLAG_REPLY_RING);
 
         list_add(&ring_info->node,
                  &link->ring_hash[hash_index(&ring_info->id)]);
@@ -2117,7 +2125,18 @@ register_ring(struct domain *currd,
     ret = create_ring(currd, link, &ring_id, new_ring_info, gfn_hnd, reg.len,
                       npage, flags);
     if ( !ret )
+    {
+        /* Add the new ring to the forward ring's list of reply rings */
+        if ( flags & XEN_ARGO_REGISTER_FLAG_REPLY_RING )
+        {
+            spin_lock(&fwd_ring_info->L4_lock);
+
+            list_add(&new_ring_info->reply_node, &fwd_ring_info->reply_list);
+
+            spin_unlock(&fwd_ring_info->L4_lock);
+        }
         new_ring_info = NULL;
+    }
 
  out_unlock2:
     write_unlock(&link->rings_L3_rwlock);
