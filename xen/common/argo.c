@@ -1786,6 +1786,155 @@ create_link(struct domain *currd, domid_t partner_id, struct domain *dst_d)
 }
 
 static long
+create_ring(struct domain *currd, struct argo_link *link,
+            const struct argo_ring_id *ring_id,
+            struct argo_ring_info *new_ring_info,
+            XEN_GUEST_HANDLE_PARAM(xen_argo_gfn_t) gfn_hnd,
+            unsigned int len, unsigned int npage, unsigned int flags)
+{
+    int ret = 0;
+    struct argo_ring_info *ring_info;
+    unsigned int private_tx_ptr;
+    xen_argo_ring_t *ringp;
+    void *map_ringp;
+
+    ASSERT(LOCKING_Write_rings_L3(currd, link));
+
+    /* Minimize criticial region for count_L2: do an optimistic increment */
+    spin_lock(&currd->argo->count_L2_lock);
+
+    if ( currd->argo->ring_count >= MAX_RINGS_PER_DOMAIN )
+        ret = -ENOSPC;
+    else
+        currd->argo->ring_count++;
+
+    spin_unlock(&currd->argo->count_L2_lock);
+
+    if ( ret )
+        return ret;
+
+    ring_info = find_ring_info(currd, link, ring_id);
+    if ( !ring_info )
+    {
+        ring_info = new_ring_info;
+        new_ring_info = NULL;
+
+        spin_lock_init(&ring_info->L4_lock);
+
+        ring_info->id = *ring_id;
+        INIT_LIST_HEAD(&ring_info->pending);
+
+        list_add(&ring_info->node,
+                 &link->ring_hash[hash_index(&ring_info->id)]);
+
+        argo_dprintk("argo: vm%u registering ring (vm%u:%x vm%u)\n",
+                     currd->domain_id, ring_id->domain_id, ring_id->aport,
+                     ring_id->partner_id);
+    }
+    else if ( ring_info->len )
+    {
+        /*
+         * If the caller specified that the ring must not already exist,
+         * fail at attempt to add a completed ring which already exists.
+         */
+        if ( flags & XEN_ARGO_REGISTER_FLAG_FAIL_EXIST )
+        {
+            gprintk(XENLOG_ERR, "argo: vm%u disallowed reregistration of "
+                    "existing ring (vm%u:%x vm%u)\n",
+                    currd->domain_id, ring_id->domain_id, ring_id->aport,
+                    ring_id->partner_id);
+            ret = -EEXIST;
+            goto out_undo;
+        }
+
+        if ( ring_info->len != len )
+        {
+            /*
+             * Change of ring size could result in entries on the pending
+             * notifications list that will never trigger.
+             * Simple blunt solution: disallow ring resize for now.
+             * TODO: investigate enabling ring resize.
+             */
+            gprintk(XENLOG_ERR, "argo: vm%u attempted to change ring size "
+                    "(vm%u:%x vm%u)\n",
+                    currd->domain_id, ring_id->domain_id, ring_id->aport,
+                    ring_id->partner_id);
+            /*
+             * Could return EINVAL here, but if the ring didn't already
+             * exist then the arguments would have been valid, so: EEXIST.
+             */
+            ret = -EEXIST;
+            goto out_undo;
+        }
+
+        argo_dprintk("argo: vm%u re-registering existing ring (vm%u:%x vm%u)\n",
+                     currd->domain_id, ring_id->domain_id, ring_id->aport,
+                     ring_id->partner_id);
+    }
+
+    ret = find_ring_mfns(currd, link, ring_info, npage, gfn_hnd, len);
+    if ( ret )
+    {
+        gprintk(XENLOG_ERR,
+                "argo: vm%u failed to find ring mfns (vm%u:%x vm%u)\n",
+                currd->domain_id, ring_id->domain_id, ring_id->aport,
+                ring_id->partner_id);
+
+        ring_remove_info(currd, link, ring_info);
+        goto out_undo;
+    }
+
+    /*
+     * The first page of the memory supplied for the ring has the xen_argo_ring
+     * structure at its head, which is where the ring indexes reside.
+     */
+    ret = ring_map_page(currd, link, ring_info, 0, &map_ringp);
+    if ( ret )
+    {
+        gprintk(XENLOG_ERR,
+                "argo: vm%u failed to map ring mfn 0 (vm%u:%x vm%u)\n",
+                currd->domain_id, ring_id->domain_id, ring_id->aport,
+                ring_id->partner_id);
+
+        ring_remove_info(currd, link, ring_info);
+        goto out_undo;
+    }
+    ringp = map_ringp;
+
+    private_tx_ptr = read_atomic(&ringp->tx_ptr);
+
+    if ( (private_tx_ptr >= len) ||
+         (ROUNDUP_MESSAGE(private_tx_ptr) != private_tx_ptr) )
+    {
+        /*
+         * Since the ring is a mess, attempt to flush the contents of it
+         * here by setting the tx_ptr to the next aligned message slot past
+         * the latest rx_ptr we have observed. Handle ring wrap correctly.
+         */
+        private_tx_ptr = ROUNDUP_MESSAGE(read_atomic(&ringp->rx_ptr));
+
+        if ( private_tx_ptr >= len )
+            private_tx_ptr = 0;
+
+        update_tx_ptr(currd, link, ring_info, private_tx_ptr);
+    }
+
+    ring_info->tx_ptr = private_tx_ptr;
+    ring_info->len = len;
+
+    if ( ret )
+    {
+ out_undo:
+        /* Undo the optimistic ring count increment. */
+        spin_lock(&currd->argo->count_L2_lock);
+        currd->argo->ring_count--;
+        spin_unlock(&currd->argo->count_L2_lock);
+    }
+
+    return ret;
+}
+
+static long
 register_ring(struct domain *currd,
               XEN_GUEST_HANDLE_PARAM(xen_argo_register_ring_t) reg_hnd,
               XEN_GUEST_HANDLE_PARAM(xen_argo_gfn_t) gfn_hnd,
@@ -1793,14 +1942,10 @@ register_ring(struct domain *currd,
 {
     xen_argo_register_ring_t reg;
     struct argo_ring_id ring_id, fwd_ring_id;
-    void *map_ringp;
-    xen_argo_ring_t *ringp;
     struct argo_link *link = NULL, *fwd_link = NULL;
-    struct argo_ring_info *fwd_ring_info = NULL, *ring_info,
-                          *new_ring_info = NULL;
+    struct argo_ring_info *fwd_ring_info = NULL, *new_ring_info = NULL;
     struct domain *dst_d = NULL;
     int ret = 0;
-    unsigned int private_tx_ptr;
 
     ASSERT(currd == current->domain);
 
@@ -1959,157 +2104,26 @@ register_ring(struct domain *currd,
             }
             if ( !fwd_ring_info )
             {
-                if ( fwd_link )
-                    read_unlock(&fwd_link->rings_L3_rwlock);
-
                 ret = -ECONNREFUSED;
                 goto out_unlock2;
             }
         }
     }
 
-    ASSERT(LOCKING_Write_rings_L3(currd, link));
     ASSERT(!(flags & XEN_ARGO_REGISTER_FLAG_REPLY_RING) ||
            (currd->domain_id == ring_id.partner_id ) ||
            LOCKING_Read_rings_L3(dst_d, fwd_link));
 
-    /* Minimize criticial region for count_L2: do an optimistic increment */
-    spin_lock(&currd->argo->count_L2_lock);
-
-    if ( currd->argo->ring_count >= MAX_RINGS_PER_DOMAIN )
-        ret = -ENOSPC;
-    else
-        currd->argo->ring_count++;
-
-    spin_unlock(&currd->argo->count_L2_lock);
-
-    if ( ret )
-        goto out_unlock3;
-
-    ring_info = find_ring_info(currd, link, &ring_id);
-    if ( !ring_info )
-    {
-        ring_info = new_ring_info;
+    ret = create_ring(currd, link, &ring_id, new_ring_info, gfn_hnd, reg.len,
+                      npage, flags);
+    if ( !ret )
         new_ring_info = NULL;
 
-        spin_lock_init(&ring_info->L4_lock);
-
-        ring_info->id = ring_id;
-        INIT_LIST_HEAD(&ring_info->pending);
-
-        list_add(&ring_info->node,
-                 &link->ring_hash[hash_index(&ring_info->id)]);
-
-        argo_dprintk("argo: vm%u registering ring (vm%u:%x vm%u)\n",
-                     currd->domain_id, ring_id.domain_id, ring_id.aport,
-                     ring_id.partner_id);
-    }
-    else if ( ring_info->len )
-    {
-        /*
-         * If the caller specified that the ring must not already exist,
-         * fail at attempt to add a completed ring which already exists.
-         */
-        if ( flags & XEN_ARGO_REGISTER_FLAG_FAIL_EXIST )
-        {
-            gprintk(XENLOG_ERR, "argo: vm%u disallowed reregistration of "
-                    "existing ring (vm%u:%x vm%u)\n",
-                    currd->domain_id, ring_id.domain_id, ring_id.aport,
-                    ring_id.partner_id);
-            ret = -EEXIST;
-            goto out_undo;
-        }
-
-        if ( ring_info->len != reg.len )
-        {
-            /*
-             * Change of ring size could result in entries on the pending
-             * notifications list that will never trigger.
-             * Simple blunt solution: disallow ring resize for now.
-             * TODO: investigate enabling ring resize.
-             */
-            gprintk(XENLOG_ERR, "argo: vm%u attempted to change ring size "
-                    "(vm%u:%x vm%u)\n",
-                    currd->domain_id, ring_id.domain_id, ring_id.aport,
-                    ring_id.partner_id);
-            /*
-             * Could return EINVAL here, but if the ring didn't already
-             * exist then the arguments would have been valid, so: EEXIST.
-             */
-            ret = -EEXIST;
-            goto out_undo;
-        }
-
-        argo_dprintk("argo: vm%u re-registering existing ring (vm%u:%x vm%u)\n",
-                     currd->domain_id, ring_id.domain_id, ring_id.aport,
-                     ring_id.partner_id);
-    }
-
-    ret = find_ring_mfns(currd, link, ring_info, npage, gfn_hnd, reg.len);
-    if ( ret )
-    {
-        gprintk(XENLOG_ERR,
-                "argo: vm%u failed to find ring mfns (vm%u:%x vm%u)\n",
-                currd->domain_id, ring_id.domain_id, ring_id.aport,
-                ring_id.partner_id);
-
-        ring_remove_info(currd, link, ring_info);
-        goto out_undo;
-    }
-
-    /*
-     * The first page of the memory supplied for the ring has the xen_argo_ring
-     * structure at its head, which is where the ring indexes reside.
-     */
-    ret = ring_map_page(currd, link, ring_info, 0, &map_ringp);
-    if ( ret )
-    {
-        gprintk(XENLOG_ERR,
-                "argo: vm%u failed to map ring mfn 0 (vm%u:%x vm%u)\n",
-                currd->domain_id, ring_id.domain_id, ring_id.aport,
-                ring_id.partner_id);
-
-        ring_remove_info(currd, link, ring_info);
-        goto out_undo;
-    }
-    ringp = map_ringp;
-
-    private_tx_ptr = read_atomic(&ringp->tx_ptr);
-
-    if ( (private_tx_ptr >= reg.len) ||
-         (ROUNDUP_MESSAGE(private_tx_ptr) != private_tx_ptr) )
-    {
-        /*
-         * Since the ring is a mess, attempt to flush the contents of it
-         * here by setting the tx_ptr to the next aligned message slot past
-         * the latest rx_ptr we have observed. Handle ring wrap correctly.
-         */
-        private_tx_ptr = ROUNDUP_MESSAGE(read_atomic(&ringp->rx_ptr));
-
-        if ( private_tx_ptr >= reg.len )
-            private_tx_ptr = 0;
-
-        update_tx_ptr(currd, link, ring_info, private_tx_ptr);
-    }
-
-    ring_info->tx_ptr = private_tx_ptr;
-    ring_info->len = reg.len;
-
-    if ( ret )
-    {
- out_undo:
-        /* Undo the optimistic ring count increment. */
-        spin_lock(&currd->argo->count_L2_lock);
-        currd->argo->ring_count--;
-        spin_unlock(&currd->argo->count_L2_lock);
-    }
-
- out_unlock3:
+ out_unlock2:
     write_unlock(&link->rings_L3_rwlock);
     if ( fwd_link && (fwd_link != link) )
         read_unlock(&fwd_link->rings_L3_rwlock);
 
- out_unlock2:
     read_unlock(&currd->argo->links_L2_rwlock);
     if ( (flags & XEN_ARGO_REGISTER_FLAG_REPLY_RING) &&
          (currd->domain_id != dst_d->domain_id) )
