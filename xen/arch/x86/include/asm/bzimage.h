@@ -5,7 +5,7 @@
 
 unsigned long bzimage_headroom(void *image_start, unsigned long image_length);
 
-int bzimage_parse(void *image_base, void **image_start,
+int bzimage_parse(void *image_base, void **image_start, unsigned int headroom,
                   unsigned long *image_len);
 
 #endif /* __X86_BZIMAGE_H__ */

@@ -273,9 +273,15 @@ static struct boot_info __initdata *boot_info;
 
 static void __init multiboot_to_bootinfo(multiboot_info_t *mbi)
 {
-    static struct boot_info __initdata info;
+    static struct boot_info       __initdata info;
+    static struct boot_module     __initdata boot_mods[1];
+    static struct arch_bootmodule __initdata arch_boot_mods[1];
+
+    info.mods = boot_mods;
 
     info.nr_mods = mbi->mods_count;
+
+    boot_mods[0].arch = &arch_boot_mods[0];
 
     boot_info = &info;
 }
@@ -961,7 +967,8 @@ static struct domain *__init create_dom0(const module_t *image,
         write_cr4(read_cr4() & ~X86_CR4_SMAP);
     }
 
-    if ( construct_dom0(d, image, headroom, initrd, cmdline) != 0 )
+    if ( construct_dom0(d, image, boot_info->mods[0].arch->headroom, initrd,
+                        cmdline) != 0 )
         panic("Could not construct domain 0\n");
 
     if ( cpu_has_smap )
@@ -985,7 +992,7 @@ void __init noreturn __start_xen(unsigned long mbi_p)
     unsigned int initrdidx, num_parked = 0;
     multiboot_info_t *mbi;
     module_t *mod;
-    unsigned long nr_pages, raw_max_page, modules_headroom, module_map[1];
+    unsigned long nr_pages, raw_max_page, module_map[1];
     int i, j, e820_warn = 0, bytes = 0;
     unsigned long eb_start, eb_end;
     bool acpi_boot_table_init_done = false, relocated = false;
@@ -1353,7 +1360,8 @@ void __init noreturn __start_xen(unsigned long mbi_p)
         mod[boot_info->nr_mods].mod_end = __2M_rwdata_end - _stext;
     }
 
-    modules_headroom = bzimage_headroom(bootstrap_map(mod), mod->mod_end);
+    boot_info->mods[0].arch->headroom = bzimage_headroom(bootstrap_map(mod),
+                                                         mod->mod_end);
     bootstrap_map(NULL);
 
 #ifndef highmem_start
@@ -1433,7 +1441,8 @@ void __init noreturn __start_xen(unsigned long mbi_p)
         /* Is the region suitable for relocating the multiboot modules? */
         for ( j = boot_info->nr_mods - 1; j >= 0; j-- )
         {
-            unsigned long headroom = j ? 0 : modules_headroom;
+            struct boot_module *boot_mods = boot_info->mods;
+            unsigned long headroom = j ? 0 : boot_mods[0].arch->headroom;
             unsigned long size = PAGE_ALIGN(headroom + mod[j].mod_end);
 
             if ( mod[j].reserved )
@@ -1481,7 +1490,7 @@ void __init noreturn __start_xen(unsigned long mbi_p)
 #endif
     }
 
-    if ( modules_headroom && !mod->reserved )
+    if ( boot_info->mods[0].arch->headroom && !mod->reserved )
         panic("Not enough memory to relocate the dom0 kernel image\n");
     for ( i = 0; i < boot_info->nr_mods; ++i )
     {
@@ -2021,7 +2030,7 @@ void __init noreturn __start_xen(unsigned long mbi_p)
      * We're going to setup domain0 using the module(s) that we stashed safely
      * above our heap. The second module, if present, is an initrd ramdisk.
      */
-    dom0 = create_dom0(mod, modules_headroom,
+    dom0 = create_dom0(mod, boot_info->mods[0].arch->headroom,
                        initrdidx < boot_info->nr_mods ? mod + initrdidx : NULL,
                        kextra, loader);
     if ( !dom0 )
