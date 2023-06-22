@@ -14,6 +14,7 @@
 #include <xen/sched.h>
 #include <xen/softirq.h>
 
+#include <asm/boot.h>
 #include <asm/bzimage.h>
 #include <asm/dom0_build.h>
 #include <asm/guest.h>
@@ -374,7 +375,7 @@ int __init dom0_construct_pv(struct domain *d,
     unsigned int flush_flags = 0;
     start_info_t *si;
     struct vcpu *v = d->vcpu[0];
-    void *image_base = bootstrap_map(image);
+    void *image_base = bootstrap_map_multiboot(image);
     unsigned long image_len = image->mod_end;
     void *image_start = image_base + image_headroom;
     unsigned long initrd_len = initrd ? initrd->mod_end : 0;

@@ -34,6 +34,7 @@
 #include <xen/watchdog.h>
 
 #include <asm/apic.h>
+#include <asm/boot.h>
 #include <asm/cpu-policy.h>
 #include <asm/delay.h>
 #include <asm/nmi.h>
@@ -180,7 +181,7 @@ void __init microcode_scan_module(
         if ( !test_bit(i, module_map) )
             continue;
 
-        _blob_start = bootstrap_map(&mod[i]);
+        _blob_start = bootstrap_map_multiboot(&mod[i]);
         _blob_size = mod[i].mod_end;
         if ( !_blob_start )
         {
@@ -798,7 +799,7 @@ int __init microcode_init_cache(unsigned long *module_map,
         microcode_scan_module(module_map, mbi);
 
     if ( ucode_mod.mod_end )
-        rc = early_update_cache(bootstrap_map(&ucode_mod),
+        rc = early_update_cache(bootstrap_map_multiboot(&ucode_mod),
                                 ucode_mod.mod_end);
     else if ( ucode_blob.size )
         rc = early_update_cache(ucode_blob.data, ucode_blob.size);
@@ -821,7 +822,7 @@ static int __init early_microcode_update_cpu(void)
     else if ( ucode_mod.mod_end )
     {
         len = ucode_mod.mod_end;
-        data = bootstrap_map(&ucode_mod);
+        data = bootstrap_map_multiboot(&ucode_mod);
     }
 
     if ( !data )

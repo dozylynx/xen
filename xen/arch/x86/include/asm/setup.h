@@ -1,6 +1,7 @@
 #ifndef __X86_SETUP_H_
 #define __X86_SETUP_H_
 
+#include <xen/bootinfo.h>
 #include <xen/multiboot.h>
 #include <asm/numa.h>
 
@@ -40,7 +41,7 @@ void setup_io_bitmap(struct domain *d);
 
 unsigned long initial_images_nrpages(nodeid_t node);
 void discard_initial_images(void);
-void *bootstrap_map(const module_t *mod);
+void *bootstrap_map(const struct boot_module *mod);
 
 int xen_in_range(unsigned long mfn);
 

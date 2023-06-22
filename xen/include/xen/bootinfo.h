@@ -10,6 +10,9 @@
 #endif
 
 struct boot_module {
+    paddr_t start;
+    size_t size;
+
     struct arch_bootmodule *arch;
 };
 

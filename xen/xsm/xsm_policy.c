@@ -20,6 +20,7 @@
 
 #include <xsm/xsm.h>
 #ifdef CONFIG_MULTIBOOT
+#include <asm/boot.h>
 #include <xen/multiboot.h>
 #include <asm/setup.h>
 #endif
@@ -49,7 +50,7 @@ int __init xsm_multiboot_policy_init(
         if ( !test_bit(i, module_map) )
             continue;
 
-        _policy_start = bootstrap_map(mod + i);
+        _policy_start = bootstrap_map_multiboot(mod + i);
         _policy_len   = mod[i].mod_end;
 
         if ( (xsm_magic_t)(*_policy_start) == XSM_MAGIC )

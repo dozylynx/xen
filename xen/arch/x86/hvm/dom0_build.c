@@ -16,6 +16,7 @@
 
 #include <acpi/actables.h>
 
+#include <asm/boot.h>
 #include <asm/bzimage.h>
 #include <asm/dom0_build.h>
 #include <asm/hvm/support.h>
@@ -1208,7 +1209,8 @@ int __init dom0_construct_pvh(struct domain *d, const module_t *image,
         return rc;
     }
 
-    rc = pvh_load_kernel(d, image, image_headroom, initrd, bootstrap_map(image),
+    rc = pvh_load_kernel(d, image, image_headroom, initrd,
+                         bootstrap_map_multiboot(image),
                          cmdline, &entry, &start_info);
     if ( rc )
     {

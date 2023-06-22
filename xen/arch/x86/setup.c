@@ -32,6 +32,7 @@
 #include <compat/xen.h>
 #endif
 #include <xen/bitops.h>
+#include <asm/boot.h>
 #include <asm/smp.h>
 #include <asm/processor.h>
 #include <asm/mpspec.h>
@@ -405,14 +406,14 @@ static void __init normalise_cpu_order(void)
  * Ensure a given physical memory range is present in the bootstrap mappings.
  * Use superpage mappings to ensure that pagetable memory needn't be allocated.
  */
-void *__init bootstrap_map(const module_t *mod)
+void *__init bootstrap_map(const struct boot_module *mod)
 {
     static unsigned long __initdata map_cur = BOOTSTRAP_MAP_BASE;
     uint64_t start, end, mask = (1L << L2_PAGETABLE_SHIFT) - 1;
     void *ret;
 
     if ( system_state != SYS_STATE_early_boot )
-        return mod ? mfn_to_virt(mod->mod_start) : NULL;
+        return mod ? maddr_to_virt(mod->start) : NULL;
 
     if ( !mod )
     {
@@ -421,8 +422,8 @@ void *__init bootstrap_map(const module_t *mod)
         return NULL;
     }
 
-    start = (uint64_t)mod->mod_start << PAGE_SHIFT;
-    end = start + mod->mod_end;
+    start = (uint64_t)mod->start;
+    end = start + mod->size;
     if ( start >= end )
         return NULL;
 
@@ -460,7 +461,7 @@ static void __init move_memory(
         if ( mod.mod_end > blksz )
             mod.mod_end = blksz;
         sz = mod.mod_end - soffs;
-        s = bootstrap_map(&mod);
+        s = bootstrap_map_multiboot(&mod);
 
         mod.mod_start = (dst - doffs) >> PAGE_SHIFT;
         mod.mod_end = doffs + size;
@@ -468,7 +469,7 @@ static void __init move_memory(
             mod.mod_end = blksz;
         if ( sz > mod.mod_end - doffs )
             sz = mod.mod_end - doffs;
-        d = bootstrap_map(&mod);
+        d = bootstrap_map_multiboot(&mod);
 
         memmove(d + doffs, s + soffs, sz);
 
@@ -1360,8 +1361,9 @@ void __init noreturn __start_xen(unsigned long mbi_p)
         mod[boot_info->nr_mods].mod_end = __2M_rwdata_end - _stext;
     }
 
-    boot_info->mods[0].arch->headroom = bzimage_headroom(bootstrap_map(mod),
-                                                         mod->mod_end);
+    boot_info->mods[0].arch->headroom =
+        bzimage_headroom(bootstrap_map_multiboot(mod), mod->mod_end);
+
     bootstrap_map(NULL);
 
 #ifndef highmem_start
