@@ -8,9 +8,9 @@
  */
 
 #include <xen/acpi.h>
+#include <xen/bootinfo.h>
 #include <xen/init.h>
 #include <xen/libelf.h>
-#include <xen/multiboot.h>
 #include <xen/pci.h>
 #include <xen/softirq.h>
 
@@ -530,14 +530,13 @@ static paddr_t __init find_memory(
     return INVALID_PADDR;
 }
 
-static int __init pvh_load_kernel(struct domain *d, const module_t *image,
-                                  unsigned long image_headroom,
-                                  module_t *initrd, void *image_base,
-                                  char *cmdline, paddr_t *entry,
-                                  paddr_t *start_info_addr)
+static int __init pvh_load_kernel(
+    struct domain *d, const struct boot_module *image,
+    struct boot_module *initrd, void *image_base, char *cmdline, paddr_t *entry,
+    paddr_t *start_info_addr)
 {
-    void *image_start = image_base + image_headroom;
-    unsigned long image_len = image->mod_end;
+    void *image_start = image_base + image->arch->headroom;
+    unsigned long image_len = image->size;
     struct elf_binary elf;
     struct elf_dom_parms parms;
     paddr_t last_addr;
@@ -546,7 +545,7 @@ static int __init pvh_load_kernel(struct domain *d, const module_t *image,
     struct vcpu *v = d->vcpu[0];
     int rc;
 
-    if ( (rc = bzimage_parse(image_base, &image_start, image_headroom,
+    if ( (rc = bzimage_parse(image_base, &image_start, image->arch->headroom,
                              &image_len)) != 0 )
     {
         printk("Error trying to detect bz compressed kernel\n");
@@ -594,7 +593,7 @@ static int __init pvh_load_kernel(struct domain *d, const module_t *image,
      * simplify it.
      */
     last_addr = find_memory(d, &elf, sizeof(start_info) +
-                            (initrd ? ROUNDUP(initrd->mod_end, PAGE_SIZE) +
+                            (initrd ? ROUNDUP(initrd->size, PAGE_SIZE) +
                                       sizeof(mod)
                                     : 0) +
                             (cmdline ? ROUNDUP(strlen(cmdline) + 1,
@@ -608,8 +607,8 @@ static int __init pvh_load_kernel(struct domain *d, const module_t *image,
 
     if ( initrd != NULL )
     {
-        rc = hvm_copy_to_guest_phys(last_addr, mfn_to_virt(initrd->mod_start),
-                                    initrd->mod_end, v);
+        rc = hvm_copy_to_guest_phys(last_addr, maddr_to_virt(initrd->start),
+                                    initrd->size, v);
         if ( rc )
         {
             printk("Unable to copy initrd to guest\n");
@@ -617,11 +616,11 @@ static int __init pvh_load_kernel(struct domain *d, const module_t *image,
         }
 
         mod.paddr = last_addr;
-        mod.size = initrd->mod_end;
-        last_addr += ROUNDUP(initrd->mod_end, elf_64bit(&elf) ? 8 : 4);
-        if ( initrd->string )
+        mod.size = initrd->size;
+        last_addr += ROUNDUP(initrd->size, elf_64bit(&elf) ? 8 : 4);
+        if ( initrd->string.len )
         {
-            char *str = __va(initrd->string);
+            char *str = initrd->string.bytes;
             size_t len = strlen(str) + 1;
 
             rc = hvm_copy_to_guest_phys(last_addr, str, len, v);
@@ -1176,10 +1175,9 @@ static void __hwdom_init pvh_setup_mmcfg(struct domain *d)
     }
 }
 
-int __init dom0_construct_pvh(struct domain *d, const module_t *image,
-                              unsigned long image_headroom,
-                              module_t *initrd,
-                              char *cmdline)
+int __init dom0_construct_pvh(
+    struct domain *d, const struct boot_module *image,
+    struct boot_module *initrd, char *cmdline)
 {
     paddr_t entry, start_info;
     int rc;
@@ -1209,9 +1207,8 @@ int __init dom0_construct_pvh(struct domain *d, const module_t *image,
         return rc;
     }
 
-    rc = pvh_load_kernel(d, image, image_headroom, initrd,
-                         bootstrap_map_multiboot(image),
-                         cmdline, &entry, &start_info);
+    rc = pvh_load_kernel(d, image, initrd, bootstrap_map(image), cmdline,
+                         &entry, &start_info);
     if ( rc )
     {
         printk("Failed to load Dom0 kernel\n");

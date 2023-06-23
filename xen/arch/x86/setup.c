@@ -37,6 +37,7 @@
 #include <asm/processor.h>
 #include <asm/mpspec.h>
 #include <asm/apic.h>
+#include <asm/boot.h>
 #include <asm/msi.h>
 #include <asm/desc.h>
 #include <asm/paging.h>
@@ -58,6 +59,9 @@
 #include <asm/microcode.h>
 #include <asm/prot-key.h>
 #include <asm/pv/domain.h>
+
+/* Max number of boot modules a bootloader can provide in addition to Xen */
+#define MAX_NR_BOOTMODS 63
 
 /* opt_nosmp: If true, secondary processors are ignored. */
 static bool __initdata opt_nosmp;
@@ -269,20 +273,44 @@ static int __init cf_check parse_acpi_param(const char *s)
 }
 custom_param("acpi", parse_acpi_param);
 
-static const module_t *__initdata initial_images;
 static struct boot_info __initdata *boot_info;
 
-static void __init multiboot_to_bootinfo(multiboot_info_t *mbi)
+static void __init multiboot_to_bootinfo(multiboot_info_t *mbi, module_t *mods)
 {
     static struct boot_info       __initdata info;
-    static struct boot_module     __initdata boot_mods[1];
-    static struct arch_bootmodule __initdata arch_boot_mods[1];
+    static struct arch_boot_info  __initdata arch_info;
+    static struct boot_module     __initdata boot_mods[MAX_NR_BOOTMODS + 1];
+    static struct arch_bootmodule __initdata arch_boot_mods[
+                                                       MAX_NR_BOOTMODS + 1];
 
+    int i;
+
+    info.arch = &arch_info;
     info.mods = boot_mods;
 
-    info.nr_mods = mbi->mods_count;
+    info.cmdline = __va(mbi->cmdline);
 
-    boot_mods[0].arch = &arch_boot_mods[0];
+    /* The BOOTINFO_FLAG_X86_* flags are a 1-1 map to MBI_* */
+    arch_info.flags = mbi->flags;
+    arch_info.mmap_length = mbi->mmap_length;
+    arch_info.mmap_addr = mbi->mmap_addr;
+    arch_info.boot_loader_name = __va(mbi->boot_loader_name);
+
+    info.nr_mods = mbi->mods_count;
+    for ( i = 0; i <= MAX_NR_BOOTMODS; i++ )
+    {
+        boot_mods[i].arch = &arch_boot_mods[i];
+
+        if ( i < info.nr_mods )
+        {
+            bootmodule_update_start(&boot_mods[i], mods[i].mod_start);
+            boot_mods[i].size = mods[i].mod_end - mods[i].mod_start;
+
+            boot_mods[i].string.len = strlcpy(boot_mods[i].string.bytes,
+                                             __va(mods[i].string),
+                                             BOOTMOD_STRING_MAX_LEN);
+        }
+    }
 
     boot_info = &info;
 }
@@ -296,8 +324,8 @@ unsigned long __init initial_images_nrpages(nodeid_t node)
 
     for ( nr = i = 0; i < boot_info->nr_mods; ++i )
     {
-        unsigned long start = initial_images[i].mod_start;
-        unsigned long end = start + PFN_UP(initial_images[i].mod_end);
+        unsigned long start = mfn_x(boot_info->mods[i].mfn);
+        unsigned long end = start + PFN_UP(boot_info->mods[i].size);
 
         if ( end > node_start && node_end > start )
             nr += min(node_end, end) - max(node_start, start);
@@ -312,14 +340,13 @@ void __init discard_initial_images(void)
 
     for ( i = 0; i < boot_info->nr_mods; ++i )
     {
-        uint64_t start = (uint64_t)initial_images[i].mod_start << PAGE_SHIFT;
+        uint64_t start = boot_info->mods[i].start;
 
         init_domheap_pages(start,
-                           start + PAGE_ALIGN(initial_images[i].mod_end));
+                           start + PAGE_ALIGN(boot_info->mods[i].size));
     }
 
     boot_info->nr_mods = 0;
-    initial_images = NULL;
 }
 
 extern unsigned char __init_begin[], __init_end[];
@@ -450,26 +477,26 @@ static void __init move_memory(
 
     while ( size )
     {
-        module_t mod;
+        struct boot_module mod;
         unsigned int soffs = src & mask;
         unsigned int doffs = dst & mask;
         unsigned int sz;
         void *d, *s;
 
-        mod.mod_start = (src - soffs) >> PAGE_SHIFT;
-        mod.mod_end = soffs + size;
-        if ( mod.mod_end > blksz )
-            mod.mod_end = blksz;
-        sz = mod.mod_end - soffs;
-        s = bootstrap_map_multiboot(&mod);
+        mod.start = src - soffs;
+        mod.size = soffs + size;
+        if ( mod.size > blksz )
+            mod.size = blksz;
+        sz = mod.size - soffs;
+        s = bootstrap_map(&mod);
 
-        mod.mod_start = (dst - doffs) >> PAGE_SHIFT;
-        mod.mod_end = doffs + size;
-        if ( mod.mod_end > blksz )
-            mod.mod_end = blksz;
-        if ( sz > mod.mod_end - doffs )
-            sz = mod.mod_end - doffs;
-        d = bootstrap_map_multiboot(&mod);
+        mod.start = dst - doffs;
+        mod.size = doffs + size;
+        if ( mod.size > blksz )
+            mod.size = blksz;
+        if ( sz > mod.size - doffs )
+            sz = mod.size - doffs;
+        d = bootstrap_map(&mod);
 
         memmove(d + doffs, s + soffs, sz);
 
@@ -602,7 +629,7 @@ static void __init noinline move_xen(void)
 #undef BOOTSTRAP_MAP_LIMIT
 
 static uint64_t __init consider_modules(
-    uint64_t s, uint64_t e, uint32_t size, const module_t *mod,
+    uint64_t s, uint64_t e, uint32_t size, const struct boot_module *mod,
     unsigned int nr_mods, unsigned int this_mod)
 {
     unsigned int i;
@@ -612,8 +639,8 @@ static uint64_t __init consider_modules(
 
     for ( i = 0; i < nr_mods ; ++i )
     {
-        uint64_t start = (uint64_t)mod[i].mod_start << PAGE_SHIFT;
-        uint64_t end = start + PAGE_ALIGN(mod[i].mod_end);
+        uint64_t start = mod[i].start;
+        uint64_t end = start + PAGE_ALIGN(mod[i].size);
 
         if ( i == this_mod )
             continue;
@@ -883,9 +910,8 @@ static unsigned int __init copy_bios_e820(struct e820entry *map, unsigned int li
     return n;
 }
 
-static struct domain *__init create_dom0(const module_t *image,
-                                         unsigned long headroom,
-                                         module_t *initrd, const char *kextra,
+static struct domain *__init create_dom0(const struct boot_info *bootinfo,
+                                         const char *kextra,
                                          const char *loader)
 {
     struct xen_domctl_createdomain dom0_cfg = {
@@ -899,9 +925,14 @@ static struct domain *__init create_dom0(const module_t *image,
             .misc_flags = opt_dom0_msr_relaxed ? XEN_X86_MSR_RELAXED : 0,
         },
     };
+    struct boot_module *image = bootmodule_next(bootinfo, BOOTMOD_KERNEL);
+    struct boot_module *initrd = bootmodule_next(bootinfo, BOOTMOD_RAMDISK);
     struct domain *d;
     char *cmdline;
-    domid_t domid;
+    domid_t domid = 0;
+
+    if ( image == NULL )
+        panic("Error creating d%uv0\n", domid);
 
     if ( opt_dom0_pvh )
     {
@@ -928,7 +959,7 @@ static struct domain *__init create_dom0(const module_t *image,
         panic("Error creating d%uv0\n", domid);
 
     /* Grab the DOM0 command line. */
-    cmdline = image->string ? __va(image->string) : NULL;
+    cmdline = image->string.len ? image->string.bytes : NULL;
     if ( cmdline || kextra )
     {
         static char __initdata dom0_cmdline[MAX_GUEST_CMDLINE];
@@ -968,8 +999,7 @@ static struct domain *__init create_dom0(const module_t *image,
         write_cr4(read_cr4() & ~X86_CR4_SMAP);
     }
 
-    if ( construct_dom0(d, image, boot_info->mods[0].arch->headroom, initrd,
-                        cmdline) != 0 )
+    if ( construct_dom0(d, image, initrd, cmdline) != 0 )
         panic("Could not construct domain 0\n");
 
     if ( cpu_has_smap )
@@ -1038,14 +1068,14 @@ void __init noreturn __start_xen(unsigned long mbi_p)
         mod = __va(mbi->mods_addr);
     }
 
-    multiboot_to_bootinfo(mbi);
+    multiboot_to_bootinfo(mbi, mod);
 
-    loader = (mbi->flags & MBI_LOADERNAME)
-        ? (char *)__va(mbi->boot_loader_name) : "unknown";
+    loader = (boot_info->arch->flags & BOOTINFO_FLAG_X86_LOADERNAME)
+        ? boot_info->arch->boot_loader_name : "unknown";
 
     /* Parse the command-line options. */
-    cmdline = cmdline_cook((mbi->flags & MBI_CMDLINE) ?
-                           __va(mbi->cmdline) : NULL,
+    cmdline = cmdline_cook((boot_info->arch->flags & BOOTINFO_FLAG_X86_CMDLINE) ?
+                            boot_info->cmdline : NULL,
                            loader);
     if ( (kextra = strstr(cmdline, " -- ")) != NULL )
     {
@@ -1147,19 +1177,22 @@ void __init noreturn __start_xen(unsigned long mbi_p)
            bootsym(boot_edd_info_nr));
 
     /* Check that we have at least one Multiboot module. */
-    if ( !(mbi->flags & MBI_MODULES) || (boot_info->nr_mods == 0) )
+    if ( !(boot_info->arch->flags & BOOTINFO_FLAG_X86_MODULES) ||
+         (boot_info->nr_mods == 0) )
         panic("dom0 kernel not specified. Check bootloader configuration\n");
 
     /* Check that we don't have a silly number of modules. */
-    if ( boot_info->nr_mods > sizeof(module_map) * 8 )
+    if ( boot_info->nr_mods > MAX_NR_BOOTMODS + 1 )
     {
-        boot_info->nr_mods = sizeof(module_map) * 8;
+        boot_info->nr_mods = MAX_NR_BOOTMODS + 1;
         printk("Excessive multiboot modules - using the first %u only\n",
                boot_info->nr_mods);
     }
 
-    bitmap_fill(module_map, boot_info->nr_mods);
+    /* Dom0 kernel is the first boot module */
+    bitmap_fill(module_map, mbi->mods_count);
     __clear_bit(0, module_map); /* Dom0 kernel is always first */
+    boot_info->mods[0].bootmod_type = BOOTMOD_KERNEL;
 
     if ( pvh_boot )
     {
@@ -1189,13 +1222,13 @@ void __init noreturn __start_xen(unsigned long mbi_p)
     {
         memmap_type = "Xen-e820";
     }
-    else if ( mbi->flags & MBI_MEMMAP )
+    else if ( boot_info->arch->flags & BOOTINFO_FLAG_X86_MEMMAP )
     {
         memmap_type = "Multiboot-e820";
-        while ( bytes < mbi->mmap_length &&
+        while ( bytes < boot_info->arch->mmap_length &&
                 e820_raw.nr_map < ARRAY_SIZE(e820_raw.map) )
         {
-            memory_map_t *map = __va(mbi->mmap_addr + bytes);
+            struct mb_memmap *map = __va(boot_info->arch->mmap_addr + bytes);
 
             /*
              * This is a gross workaround for a BIOS bug. Some bootloaders do
@@ -1330,17 +1363,9 @@ void __init noreturn __start_xen(unsigned long mbi_p)
     set_kexec_crash_area_size((u64)nr_pages << PAGE_SHIFT);
     kexec_reserve_area(&boot_e820);
 
-    initial_images = mod;
-    boot_info->nr_mods = boot_info->nr_mods;
-
     for ( i = 0; !efi_enabled(EFI_LOADER) && i < boot_info->nr_mods; i++ )
-    {
-        if ( mod[i].mod_start & (PAGE_SIZE - 1) )
+        if ( boot_info->mods[i].start & (PAGE_SIZE - 1) )
             panic("Bootloader didn't honor module alignment request\n");
-        mod[i].mod_end -= mod[i].mod_start;
-        mod[i].mod_start >>= PAGE_SHIFT;
-        mod[i].reserved = 0;
-    }
 
     /*
      * TODO: load ucode earlier once multiboot modules become accessible
@@ -1357,12 +1382,14 @@ void __init noreturn __start_xen(unsigned long mbi_p)
          * respective reserve_e820_ram() invocation below. No need to
          * query efi_boot_mem_unused() here, though.
          */
-        mod[boot_info->nr_mods].mod_start = virt_to_mfn(_stext);
-        mod[boot_info->nr_mods].mod_end = __2M_rwdata_end - _stext;
+        bootmodule_update_start(&boot_info->mods[boot_info->nr_mods],
+                                virt_to_maddr(_stext));
+        boot_info->mods[boot_info->nr_mods].size = __2M_rwdata_end - _stext;
     }
 
     boot_info->mods[0].arch->headroom =
-        bzimage_headroom(bootstrap_map_multiboot(mod), mod->mod_end);
+        bzimage_headroom(bootstrap_map(&boot_info->mods[0]),
+                         boot_info->mods[0].size);
 
     bootstrap_map(NULL);
 
@@ -1420,7 +1447,7 @@ void __init noreturn __start_xen(unsigned long mbi_p)
         {
             /* Don't overlap with modules. */
             end = consider_modules(s, e, reloc_size + mask,
-                                   mod, boot_info->nr_mods, -1);
+                                   boot_info->mods, boot_info->nr_mods, -1);
             end &= ~mask;
         }
         else
@@ -1443,15 +1470,15 @@ void __init noreturn __start_xen(unsigned long mbi_p)
         /* Is the region suitable for relocating the multiboot modules? */
         for ( j = boot_info->nr_mods - 1; j >= 0; j-- )
         {
-            struct boot_module *boot_mods = boot_info->mods;
-            unsigned long headroom = j ? 0 : boot_mods[0].arch->headroom;
-            unsigned long size = PAGE_ALIGN(headroom + mod[j].mod_end);
+            struct boot_module *boot_mod = boot_info->mods;
+            unsigned long headroom = j ? 0 : boot_mod[0].arch->headroom;
+            unsigned long size = PAGE_ALIGN(headroom + boot_mod[j].size);
 
-            if ( mod[j].reserved )
+            if ( boot_mod[j].arch->flags & BOOTMOD_FLAG_X86_RELOCATED )
                 continue;
 
             /* Don't overlap with other modules (or Xen itself). */
-            end = consider_modules(s, e, size, mod,
+            end = consider_modules(s, e, size, boot_info->mods,
                                    boot_info->nr_mods + relocated, j);
 
             if ( highmem_start && end > highmem_start )
@@ -1459,14 +1486,14 @@ void __init noreturn __start_xen(unsigned long mbi_p)
 
             if ( s < end &&
                  (headroom ||
-                  ((end - size) >> PAGE_SHIFT) > mod[j].mod_start) )
+                  ((end - size) >> PAGE_SHIFT) > mfn_x(boot_mod[j].mfn)) )
             {
                 move_memory(end - size + headroom,
-                            (uint64_t)mod[j].mod_start << PAGE_SHIFT,
-                            mod[j].mod_end);
-                mod[j].mod_start = (end - size) >> PAGE_SHIFT;
-                mod[j].mod_end += headroom;
-                mod[j].reserved = 1;
+                            (uint64_t)boot_mod[j].start,
+                            boot_mod[j].size);
+                bootmodule_update_start(&boot_mod[j], end - size);
+                boot_mod[j].size += headroom;
+                boot_mod[j].arch->flags |= BOOTMOD_FLAG_X86_RELOCATED;
             }
         }
 
@@ -1478,7 +1505,8 @@ void __init noreturn __start_xen(unsigned long mbi_p)
         while ( !kexec_crash_area.start )
         {
             /* Don't overlap with modules (or Xen itself). */
-            e = consider_modules(s, e, PAGE_ALIGN(kexec_crash_area.size), mod,
+            e = consider_modules(s, e, PAGE_ALIGN(kexec_crash_area.size),
+                                 boot_info->mods,
                                  boot_info->nr_mods + relocated, -1);
             if ( s >= e )
                 break;
@@ -1492,13 +1520,14 @@ void __init noreturn __start_xen(unsigned long mbi_p)
 #endif
     }
 
-    if ( boot_info->mods[0].arch->headroom && !mod->reserved )
+    if ( boot_info->mods[0].arch->headroom &&
+         !(boot_info->mods[0].arch->flags & BOOTMOD_FLAG_X86_RELOCATED) )
         panic("Not enough memory to relocate the dom0 kernel image\n");
     for ( i = 0; i < boot_info->nr_mods; ++i )
     {
-        uint64_t s = (uint64_t)mod[i].mod_start << PAGE_SHIFT;
+        uint64_t s = (uint64_t)boot_info->mods[i].start;
 
-        reserve_e820_ram(&boot_e820, s, s + PAGE_ALIGN(mod[i].mod_end));
+        reserve_e820_ram(&boot_e820, s, s + PAGE_ALIGN(boot_info->mods[i].size));
     }
 
     if ( !xen_phys_start )
@@ -1565,8 +1594,8 @@ void __init noreturn __start_xen(unsigned long mbi_p)
                 map_e = boot_e820.map[j].addr + boot_e820.map[j].size;
                 for ( j = 0; j < boot_info->nr_mods; ++j )
                 {
-                    uint64_t end = pfn_to_paddr(mod[j].mod_start) +
-                                   mod[j].mod_end;
+                    uint64_t end = mfn_to_maddr(boot_info->mods[j].mfn) +
+                                   boot_info->mods[j].size;
 
                     if ( map_e < end )
                         map_e = end;
@@ -1641,11 +1670,12 @@ void __init noreturn __start_xen(unsigned long mbi_p)
 
     for ( i = 0; i < boot_info->nr_mods; ++i )
     {
-        set_pdx_range(mod[i].mod_start,
-                      mod[i].mod_start + PFN_UP(mod[i].mod_end));
-        map_pages_to_xen((unsigned long)mfn_to_virt(mod[i].mod_start),
-                         _mfn(mod[i].mod_start),
-                         PFN_UP(mod[i].mod_end), PAGE_HYPERVISOR);
+        set_pdx_range(mfn_x(boot_info->mods[i].mfn),
+                      mfn_x(boot_info->mods[i].mfn) +
+                      PFN_UP(boot_info->mods[i].size));
+        map_pages_to_xen((unsigned long)maddr_to_virt(boot_info->mods[i].start),
+                         boot_info->mods[i].mfn,
+                         PFN_UP(boot_info->mods[i].size), PAGE_HYPERVISOR);
     }
 
 #ifdef CONFIG_KEXEC
@@ -2022,8 +2052,12 @@ void __init noreturn __start_xen(unsigned long mbi_p)
            cpu_has_nx ? XENLOG_INFO : XENLOG_WARNING "Warning: ",
            cpu_has_nx ? "" : "not ");
 
-    initrdidx = find_first_bit(module_map, boot_info->nr_mods);
-    if ( bitmap_weight(module_map, boot_info->nr_mods) > 1 )
+    initrdidx = bootmodule_index(boot_info, BOOTMOD_UNKNOWN, 0);
+    if ( initrdidx < boot_info->nr_mods )
+        boot_info->mods[initrdidx].bootmod_type = BOOTMOD_RAMDISK;
+
+    if ( bootmodule_index(boot_info, BOOTMOD_UNKNOWN, 0) >
+            boot_info->nr_mods )
         printk(XENLOG_WARNING
                "Multiple initrd candidates, picking module #%u\n",
                initrdidx);
@@ -2032,9 +2066,7 @@ void __init noreturn __start_xen(unsigned long mbi_p)
      * We're going to setup domain0 using the module(s) that we stashed safely
      * above our heap. The second module, if present, is an initrd ramdisk.
      */
-    dom0 = create_dom0(mod, boot_info->mods[0].arch->headroom,
-                       initrdidx < boot_info->nr_mods ? mod + initrdidx : NULL,
-                       kextra, loader);
+    dom0 = create_dom0(boot_info, kextra, loader);
     if ( !dom0 )
         panic("Could not set up DOM0 guest OS\n");
 
