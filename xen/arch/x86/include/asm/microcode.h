@@ -1,6 +1,7 @@
 #ifndef ASM_X86__MICROCODE_H
 #define ASM_X86__MICROCODE_H
 
+#include <xen/bootinfo.h>
 #include <xen/types.h>
 #include <xen/percpu.h>
 
@@ -23,10 +24,8 @@ DECLARE_PER_CPU(struct cpu_signature, cpu_sig);
 
 void microcode_set_module(unsigned int idx);
 int microcode_update(XEN_GUEST_HANDLE(const_void), unsigned long len);
-int early_microcode_init(unsigned long *module_map,
-                         const struct multiboot_info *mbi);
-int microcode_init_cache(unsigned long *module_map,
-                         const struct multiboot_info *mbi);
+int early_microcode_init(struct boot_info *bootinfo);
+int microcode_init_cache(struct boot_info *bootinfo);
 int microcode_update_one(void);
 
 #endif /* ASM_X86__MICROCODE_H */

@@ -22,12 +22,12 @@
  */
 
 #include <xen/alternative-call.h>
+#include <xen/bootinfo.h>
 #include <xen/cpu.h>
 #include <xen/earlycpio.h>
 #include <xen/err.h>
 #include <xen/guest_access.h>
 #include <xen/init.h>
-#include <xen/multiboot.h>
 #include <xen/param.h>
 #include <xen/spinlock.h>
 #include <xen/stop_machine.h>
@@ -57,7 +57,6 @@
  */
 #define MICROCODE_UPDATE_TIMEOUT_US 1000000
 
-static module_t __initdata ucode_mod;
 static signed int __initdata ucode_mod_idx;
 static bool_t __initdata ucode_mod_forced;
 static unsigned int nr_cores;
@@ -150,74 +149,108 @@ static int __init cf_check parse_ucode(const char *s)
 }
 custom_param("ucode", parse_ucode);
 
-void __init microcode_scan_module(
-    unsigned long *module_map,
-    const multiboot_info_t *mbi)
+#define MICROCODE_MODULE_MATCH 1
+#define MICROCODE_MODULE_NONMATCH 0
+
+static int __init microcode_check_module(struct boot_module *mod)
 {
-    module_t *mod = (module_t *)__va(mbi->mods_addr);
     uint64_t *_blob_start;
     unsigned long _blob_size;
-    struct cpio_data cd;
+    struct cpio_data cd = { NULL, 0 };
     long offset;
     const char *p = NULL;
-    int i;
-
-    ucode_blob.size = 0;
-    if ( !ucode_scan )
-        return;
 
     if ( boot_cpu_data.x86_vendor == X86_VENDOR_AMD )
         p = "kernel/x86/microcode/AuthenticAMD.bin";
     else if ( boot_cpu_data.x86_vendor == X86_VENDOR_INTEL )
         p = "kernel/x86/microcode/GenuineIntel.bin";
     else
+        return -EFAULT;
+
+    _blob_start = bootstrap_map(mod);
+    _blob_size = mod->size;
+    if ( !_blob_start )
+    {
+        printk("Could not map multiboot module (0x%lx) (size: %ld)\n",
+               mod->start, _blob_size);
+        /* Non-fatal error, so just say no match */
+        return MICROCODE_MODULE_NONMATCH;
+    }
+
+    cd = find_cpio_data(p, _blob_start, _blob_size, &offset /* ignore */);
+
+    if ( cd.data )
+    {
+        ucode_blob.size = cd.size;
+        ucode_blob.data = cd.data;
+
+        mod->bootmod_type = BOOTMOD_UCODE;
+        return MICROCODE_MODULE_MATCH;
+    }
+
+    bootstrap_map(NULL);
+
+    return MICROCODE_MODULE_NONMATCH;
+}
+
+void __init microcode_scan_module(struct boot_info *bootinfo)
+{
+    int i;
+
+    if ( !ucode_scan )
         return;
 
-    /*
-     * Try all modules and see whichever could be the microcode blob.
-     */
-    for ( i = 1 /* Ignore dom0 kernel */; i < mbi->mods_count; i++ )
+    i = bootmodule_index(bootinfo, BOOTMOD_UNKNOWN, 0);
+    while ( i < bootinfo->nr_mods )
     {
-        if ( !test_bit(i, module_map) )
-            continue;
+        int ret = microcode_check_module(&bootinfo->mods[i]);
 
-        _blob_start = bootstrap_map_multiboot(&mod[i]);
-        _blob_size = mod[i].mod_end;
-        if ( !_blob_start )
+        switch ( ret )
         {
-            printk("Could not map multiboot module #%d (size: %ld)\n",
-                   i, _blob_size);
+        case MICROCODE_MODULE_MATCH:
+            return;
+        case MICROCODE_MODULE_NONMATCH:
+            i = bootmodule_index(bootinfo, BOOTMOD_UNKNOWN, ++i);
             continue;
+        default:
+            printk("%s: (err: %d) unable to check microcode\n",
+                   __func__, ret);
+            return;
         }
-        cd.data = NULL;
-        cd.size = 0;
-        cd = find_cpio_data(p, _blob_start, _blob_size, &offset /* ignore */);
-        if ( cd.data )
-        {
-            ucode_blob.size = cd.size;
-            ucode_blob.data = cd.data;
-            break;
-        }
-        bootstrap_map(NULL);
     }
 }
 
-static void __init microcode_grab_module(
-    unsigned long *module_map,
-    const multiboot_info_t *mbi)
+static void __init microcode_grab_module(struct boot_info *bootinfo)
 {
-    module_t *mod = (module_t *)__va(mbi->mods_addr);
+    ucode_blob.size = 0;
 
     if ( ucode_mod_idx < 0 )
-        ucode_mod_idx += mbi->mods_count;
-    if ( ucode_mod_idx <= 0 || ucode_mod_idx >= mbi->mods_count ||
-         !__test_and_clear_bit(ucode_mod_idx, module_map) )
-        goto scan;
-    ucode_mod = mod[ucode_mod_idx];
-scan:
+        ucode_mod_idx += bootinfo->nr_mods;
+    if ( ucode_mod_idx >= 0 &&  ucode_mod_idx <= bootinfo->nr_mods &&
+         bootinfo->mods[ucode_mod_idx].bootmod_type == BOOTMOD_UNKNOWN )
+    {
+        int ret = microcode_check_module(&bootinfo->mods[ucode_mod_idx]);
+
+        switch ( ret )
+        {
+        case MICROCODE_MODULE_MATCH:
+            return;
+        case MICROCODE_MODULE_NONMATCH:
+            break;
+        default:
+            printk("%s: (err: %d) unable to check microcode\n",
+                   __func__, ret);
+            return;
+        }
+    }
+
     if ( ucode_scan )
-        microcode_scan_module(module_map, mbi);
+        microcode_scan_module(bootinfo);
 }
+
+/* Undefining as they are not needed anymore */
+#undef MICROCODE_MODULE_MATCH
+#undef MICROCODE_MODULE_NONMATCH
 
 static struct microcode_ops __ro_after_init ucode_ops;
 
@@ -738,11 +771,6 @@ static int __init cf_check microcode_init(void)
         ucode_blob.size = 0;
         ucode_blob.data = NULL;
     }
-    else if ( ucode_mod.mod_end )
-    {
-        bootstrap_map(NULL);
-        ucode_mod.mod_end = 0;
-    }
 
     return 0;
 }
@@ -786,8 +814,7 @@ static int __init early_update_cache(const void *data, size_t len)
     return rc;
 }
 
-int __init microcode_init_cache(unsigned long *module_map,
-                                const struct multiboot_info *mbi)
+int __init microcode_init_cache(struct boot_info *bootinfo)
 {
     int rc = 0;
 
@@ -796,12 +823,9 @@ int __init microcode_init_cache(unsigned long *module_map,
 
     if ( ucode_scan )
         /* Need to rescan the modules because they might have been relocated */
-        microcode_scan_module(module_map, mbi);
+        microcode_scan_module(bootinfo);
 
-    if ( ucode_mod.mod_end )
-        rc = early_update_cache(bootstrap_map_multiboot(&ucode_mod),
-                                ucode_mod.mod_end);
-    else if ( ucode_blob.size )
+    if ( ucode_blob.size )
         rc = early_update_cache(ucode_blob.data, ucode_blob.size);
 
     return rc;
@@ -818,11 +842,6 @@ static int __init early_microcode_update_cpu(void)
     {
         len = ucode_blob.size;
         data = ucode_blob.data;
-    }
-    else if ( ucode_mod.mod_end )
-    {
-        len = ucode_mod.mod_end;
-        data = bootstrap_map_multiboot(&ucode_mod);
     }
 
     if ( !data )
@@ -842,8 +861,7 @@ static int __init early_microcode_update_cpu(void)
     return microcode_update_cpu(patch);
 }
 
-int __init early_microcode_init(unsigned long *module_map,
-                                const struct multiboot_info *mbi)
+int __init early_microcode_init(struct boot_info *bootinfo)
 {
     const struct cpuinfo_x86 *c = &boot_cpu_data;
     int rc = 0;
@@ -867,11 +885,11 @@ int __init early_microcode_init(unsigned long *module_map,
         return -ENODEV;
     }
 
-    microcode_grab_module(module_map, mbi);
+    microcode_grab_module(bootinfo);
 
     ucode_ops.collect_cpu_info();
 
-    if ( ucode_mod.mod_end || ucode_blob.size )
+    if ( ucode_blob.size )
         rc = early_microcode_update_cpu();
 
     return rc;
