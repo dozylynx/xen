@@ -9,6 +9,7 @@
 #include <xen/init.h>
 #include <xen/lib.h>
 #include <xen/mm.h>
+#include <xen/multiboot.h>
 
 #include <asm/e820.h>
 #include <asm/guest.h>

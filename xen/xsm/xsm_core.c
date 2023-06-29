@@ -10,8 +10,12 @@
  *  as published by the Free Software Foundation.
  */
 
-#include <xen/init.h>
+#ifndef CONFIG_HAS_DEVICE_TREE
+# include <xen/bootinfo.h>
+#endif
 #include <xen/errno.h>
+#include <xen/hypercall.h>
+#include <xen/init.h>
 #include <xen/lib.h>
 #include <xen/param.h>
 
@@ -138,26 +142,35 @@ static int __init xsm_core_init(const void *policy_buffer, size_t policy_size)
     return 0;
 }
 
-#ifdef CONFIG_MULTIBOOT
-int __init xsm_multiboot_init(
-    unsigned long *module_map, const multiboot_info_t *mbi)
+/*
+ * ifdef'ing this against multiboot is no longer valid as the boot module
+ * is agnostic and it will be possible to dropped the ifndef should Arm
+ * adopt boot info
+ */
+#ifndef CONFIG_HAS_DEVICE_TREE
+int __init xsm_bootmodule_init(const struct boot_info *bootinfo)
 {
     int ret = 0;
-    void *policy_buffer = NULL;
+    const unsigned char *policy_buffer = NULL;
     size_t policy_size = 0;
 
     printk("XSM Framework v" XSM_FRAMEWORK_VERSION " initialized\n");
 
     if ( XSM_MAGIC )
     {
-        ret = xsm_multiboot_policy_init(module_map, mbi, &policy_buffer,
-                                        &policy_size);
-        if ( ret )
-        {
-            bootstrap_map(NULL);
-            printk(XENLOG_ERR "Error %d initializing XSM policy\n", ret);
-            return -EINVAL;
-        }
+        int ret = xsm_bootmodule_policy_init(bootinfo, &policy_buffer,
+                                             &policy_size);
+        bootstrap_map(NULL);
+
+        if ( ret == -ENOENT )
+            /*
+             * The XSM module needs a policy file but one was not located.
+             * Report as a warning and continue as the XSM module may late
+             * load a policy file.
+             */
+            printk(XENLOG_WARNING "xsm: starting without a policy loaded!\n");
+        else if ( ret )
+            panic("Error %d initializing XSM policy\n", ret);
     }
 
     ret = xsm_core_init(policy_buffer, policy_size);
@@ -165,9 +178,9 @@ int __init xsm_multiboot_init(
 
     return 0;
 }
-#endif
 
-#ifdef CONFIG_HAS_DEVICE_TREE
+#else
+
 int __init xsm_dt_init(void)
 {
     int ret = 0;
@@ -215,9 +228,9 @@ bool __init has_xsm_magic(paddr_t start)
 
     return false;
 }
-#endif
+#endif /* CONFIG_HAS_DEVICE_TREE */
 
-#endif
+#endif /* CONFIG_XSM */
 
 long do_xsm_op(XEN_GUEST_HANDLE_PARAM(void) op)
 {
