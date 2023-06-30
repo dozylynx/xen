@@ -6,6 +6,7 @@ struct arch_bootmodule {
     uint32_t flags;
     unsigned headroom;
 };
+DEFINE_STRUCT_PTR_TYPE(arch_bootmodule);
 
 struct arch_boot_info {
     uint32_t flags;
@@ -14,11 +15,12 @@ struct arch_boot_info {
 #define BOOTINFO_FLAG_X86_MEMMAP       1U << 6
 #define BOOTINFO_FLAG_X86_LOADERNAME   1U << 9
 
-    char *boot_loader_name;
+    char_ptr_t boot_loader_name;
 
     uint32_t mmap_length;
     paddr_t mmap_addr;
 };
+DEFINE_STRUCT_PTR_TYPE(arch_boot_info);
 
 struct __packed mb_memmap {
     uint32_t size;

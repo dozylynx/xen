@@ -71,4 +71,15 @@ typedef bool bool_t;
 #define test_and_set_bool(b)   xchg(&(b), true)
 #define test_and_clear_bool(b) xchg(&(b), false)
 
+#ifndef DEFINE_STRUCT_PTR_TYPE
+#define DEFINE_STRUCT_PTR_TYPE(struct_name) \
+    typedef struct struct_name * struct_name ## _ptr_t;
+#endif
+
+#ifndef DEFINE_PTR_TYPE
+#define DEFINE_PTR_TYPE(type) \
+    typedef type * type ## _ptr_t;
+DEFINE_PTR_TYPE(char);
+#endif
+
 #endif /* __TYPES_H__ */

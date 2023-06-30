@@ -60,4 +60,13 @@ typedef u64 uint64_t;
 #define U16_MAX		((u16)(~0U))
 #define UINT_MAX	(~0U)
 
+typedef unsigned long long paddr_t;
+
+#define DEFINE_STRUCT_PTR_TYPE(struct_name) \
+    typedef uint64_t struct_name ## _ptr_t;
+
+#define DEFINE_PTR_TYPE(type) \
+    typedef uint64_t type ## _ptr_t;
+DEFINE_PTR_TYPE(char);
+
 #endif /* __BOOT_DEFS_H__ */

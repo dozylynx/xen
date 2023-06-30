@@ -35,17 +35,18 @@ struct boot_module {
     mfn_t mfn;
     size_t size;
 
-    struct arch_bootmodule *arch;
+    arch_bootmodule_ptr_t arch;
     struct boot_string string;
 };
+DEFINE_STRUCT_PTR_TYPE(boot_module);
 
 struct boot_info {
-    char *cmdline;
+    char_ptr_t cmdline;
 
     unsigned int nr_mods;
-    struct boot_module *mods;
+    boot_module_ptr_t mods;
 
-    struct arch_boot_info *arch;
+    arch_boot_info_ptr_t arch;
 };
 
 #endif
