@@ -5,11 +5,8 @@
 #include <xen/compiler.h>
 #include <xen/mm-frame.h>
 
-#ifdef CONFIG_X86
-#include <asm/bootinfo.h>
-#else
-    struct arch_bootmodule { };
-    struct arch_boot_info { };
+#if defined CONFIG_X86 || CONFIG_ARM || CONFIG_RISCV
+# include <asm/bootinfo.h>
 #endif
 
 /* Boot module binary type / purpose */
