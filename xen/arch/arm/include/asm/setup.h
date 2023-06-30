@@ -3,6 +3,7 @@
 
 #include <public/version.h>
 #include <asm/p2m.h>
+#include <xen/bootinfo.h>
 #include <xen/device_tree.h>
 
 #define MIN_FDT_ALIGN 8
@@ -12,15 +13,7 @@
 
 #define MAX_MODULES 32 /* Current maximum useful modules */
 
-typedef enum {
-    BOOTMOD_XEN,
-    BOOTMOD_FDT,
-    BOOTMOD_KERNEL,
-    BOOTMOD_RAMDISK,
-    BOOTMOD_XSM,
-    BOOTMOD_GUEST_DTB,
-    BOOTMOD_UNKNOWN
-}  bootmodule_kind;
+typedef bootmod_type_t bootmodule_kind;
 
 enum membank_type {
     /*
