@@ -1003,6 +1003,12 @@ static void __init efi_arch_flush_dcache_area(const void *vaddr, UINTN size)
     __flush_dcache_area(vaddr, size);
 }
 
+static struct boot_info __init *efi_arch_bootinfo_init(void)
+{
+    /* boot modules not currently in use on Arm so no init required here */
+    return NULL;
+}
+
 /*
  * Local variables:
  * mode: C

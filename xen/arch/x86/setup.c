@@ -13,7 +13,6 @@
 #include <xen/console.h>
 #include <xen/serial.h>
 #include <xen/trace.h>
-#include <xen/multiboot.h>
 #include <xen/domain_page.h>
 #include <xen/version.h>
 #include <xen/hypercall.h>
@@ -59,9 +58,6 @@
 #include <asm/microcode.h>
 #include <asm/prot-key.h>
 #include <asm/pv/domain.h>
-
-/* Max number of boot modules a bootloader can provide in addition to Xen */
-#define MAX_NR_BOOTMODS 63
 
 /* opt_nosmp: If true, secondary processors are ignored. */
 static bool __initdata opt_nosmp;
@@ -274,46 +270,6 @@ static int __init cf_check parse_acpi_param(const char *s)
 custom_param("acpi", parse_acpi_param);
 
 static struct boot_info __initdata *boot_info;
-
-static void __init multiboot_to_bootinfo(multiboot_info_t *mbi, module_t *mods)
-{
-    static struct boot_info       __initdata info;
-    static struct arch_boot_info  __initdata arch_info;
-    static struct boot_module     __initdata boot_mods[MAX_NR_BOOTMODS + 1];
-    static struct arch_bootmodule __initdata arch_boot_mods[
-                                                       MAX_NR_BOOTMODS + 1];
-
-    int i;
-
-    info.arch = &arch_info;
-    info.mods = boot_mods;
-
-    info.cmdline = __va(mbi->cmdline);
-
-    /* The BOOTINFO_FLAG_X86_* flags are a 1-1 map to MBI_* */
-    arch_info.flags = mbi->flags;
-    arch_info.mmap_length = mbi->mmap_length;
-    arch_info.mmap_addr = mbi->mmap_addr;
-    arch_info.boot_loader_name = __va(mbi->boot_loader_name);
-
-    info.nr_mods = mbi->mods_count;
-    for ( i = 0; i <= MAX_NR_BOOTMODS; i++ )
-    {
-        boot_mods[i].arch = &arch_boot_mods[i];
-
-        if ( i < info.nr_mods )
-        {
-            bootmodule_update_start(&boot_mods[i], mods[i].mod_start);
-            boot_mods[i].size = mods[i].mod_end - mods[i].mod_start;
-
-            boot_mods[i].string.len = strlcpy(boot_mods[i].string.bytes,
-                                             __va(mods[i].string),
-                                             BOOTMOD_STRING_MAX_LEN);
-        }
-    }
-
-    boot_info = &info;
-}
 
 unsigned long __init initial_images_nrpages(nodeid_t node)
 {
@@ -1014,15 +970,13 @@ static struct domain *__init create_dom0(const struct boot_info *bootinfo,
 /* How much of the directmap is prebuilt at compile time. */
 #define PREBUILT_MAP_LIMIT (1 << L2_PAGETABLE_SHIFT)
 
-void __init noreturn __start_xen(unsigned long mbi_p)
+void __init noreturn __start_xen(unsigned long bi_p)
 {
     char *memmap_type = NULL;
     char *cmdline, *kextra, *loader;
     void *bsp_stack;
     struct cpu_info *info = get_cpu_info(), *bsp_info;
     unsigned int initrdidx, num_parked = 0;
-    multiboot_info_t *mbi;
-    module_t *mod;
     unsigned long nr_pages, raw_max_page;
     int i, j, e820_warn = 0, bytes = 0;
     unsigned long eb_start, eb_end;
@@ -1059,16 +1013,29 @@ void __init noreturn __start_xen(unsigned long mbi_p)
 
     if ( pvh_boot )
     {
-        ASSERT(mbi_p == 0);
-        pvh_init(&mbi, &mod);
+        ASSERT(bi_p == 0);
+        pvh_init(&boot_info);
     }
     else
     {
-        mbi = __va(mbi_p);
-        mod = __va(mbi->mods_addr);
-    }
+        /*
+         * Since addresses were setup before virtual addressing was enabled,
+         * fixup pointers to virtual addresses for proper dereferencing.
+         */
+        boot_info = __va(bi_p);
+        boot_info->cmdline = __va(boot_info->cmdline);
+        boot_info->mods = __va(boot_info->mods);
+        boot_info->arch = __va(boot_info->arch);
 
-    multiboot_to_bootinfo(mbi, mod);
+        boot_info->arch->boot_loader_name =
+            __va(boot_info->arch->boot_loader_name);
+
+        for ( i = 0; i <= boot_info->nr_mods; i++ )
+        {
+            boot_info->mods[i].mfn = maddr_to_mfn(boot_info->mods[i].start);
+            boot_info->mods[i].arch = __va(boot_info->mods[i].arch);
+        }
+    }
 
     loader = (boot_info->arch->flags & BOOTINFO_FLAG_X86_LOADERNAME)
         ? boot_info->arch->boot_loader_name : "unknown";

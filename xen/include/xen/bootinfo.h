@@ -20,13 +20,16 @@
 #define BOOTMOD_GUEST_DTB   7
 typedef unsigned int bootmod_type_t;
 
+/* Max number of boot modules a bootloader can provide in addition to Xen */
+#define MAX_NR_BOOTMODS 63
+
 #define BOOTMOD_STRING_MAX_LEN 1024
-struct boot_string {
+struct __packed boot_string {
     char bytes[BOOTMOD_STRING_MAX_LEN];
     size_t len;
 };
 
-struct boot_module {
+struct __packed boot_module {
     bootmod_type_t bootmod_type;
     paddr_t start;
     mfn_t mfn;
@@ -37,7 +40,7 @@ struct boot_module {
 };
 DEFINE_STRUCT_PTR_TYPE(boot_module);
 
-struct boot_info {
+struct __packed boot_info {
     char_ptr_t cmdline;
 
     unsigned int nr_mods;

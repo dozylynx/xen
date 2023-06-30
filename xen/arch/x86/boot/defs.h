@@ -44,6 +44,7 @@
         _x > _y ? _x : _y; })
 
 #define _p(val)		((void *)(unsigned long)(val))
+#define _addr(val)  ((unsigned long)(void *)(val))
 
 #define tolower(c)	((c) | 0x20)
 
